@@ -1,0 +1,5 @@
+PyQt5>=5.15
+numpy>=1.21
+pipython>=2.10     # PI stage
+# CameraDevice.py uses ctypes (stdlib) and the Hamamatsu DCAM4 Windows DLL
+# No extra pip package needed for the camera — just ensure dcamapi.dll is installed

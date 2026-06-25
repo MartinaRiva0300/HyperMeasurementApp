@@ -1,4 +1,4 @@
-# Microscope Control App
+# Hyperspectral Measurements Control App
 
 PyQt5 desktop application for coordinated control of:
 - **Hamamatsu Orca Flash 4V3** camera (via DCAM4 / `CameraDevice.py`)

@@ -1,4 +1,4 @@
-from .stage import PIStage, MockPIStage
-from .camera import VendorCamera, MockCamera
+from .stage import PIStageWrapper, StageManager, MockPIStage
+from .camera import HamamatsuCamera, MockCamera
 
-__all__ = ["PIStage", "MockPIStage", "VendorCamera", "MockCamera"]
+__all__ = ["PIStageWrapper", "StageManager", "MockPIStage", "HamamatsuCamera", "MockCamera"]

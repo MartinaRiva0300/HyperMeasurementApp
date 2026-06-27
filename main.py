@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 """
 Hyperspectral Control App
-======================
+=========================
 Hamamatsu Orca Flash 4V3  +  PI motorised stage (PI_VC_Device)
 
-HOW TO CONFIGURE
-----------------
-1. Set USE_MOCK = False when running with real hardware.
+Three panels:
+  1. Camera   — exposure, binning, ROI, trigger, live view (pyqtgraph)
+  2. Stage    — per-axis encoder read-back, to-go position, relative jog,
+                velocity, home/halt
+  3. Measurement — the hyperspectral line scan (port of hyperspectral_measure.py):
+                start_pos, step, step_num, internal/external trigger, motor
+                velocity, HDF5 saving, live image + interferogram plot.
 
-2. For each real PI axis, create a PIStageWrapper with its USB serial number
-   and axis identifier (as set in your PI_VC_Device calls).
-   Example for a single-axis system:
-       from hardware.stage import PIStageWrapper, StageManager
-       stage = StageManager([PIStageWrapper('0185500006', axis='1')])
-
-3. Camera parameters below match the ones used in your HamamatsuDevice
-   constructor and hyperspectral_measure.py.
-
-4. Make sure PI_VC_device.py and CameraDevice.py are on sys.path
-   (e.g. in this folder or in hardware/).
+All hardware I/O runs in background QThreads (see core/acquisition.py) so the
+UI and live image stay responsive.
 
 RUN
 ---
     python main.py              # mock hardware (no physical devices needed)
-    python main.py --real       # real hardware
+    python main.py --real       # real Hamamatsu + PI hardware
+
+CONFIGURE REAL HARDWARE
+-----------------------
+Edit make_real_hardware() below: set the PI USB serial number(s) / axis ids and
+camera defaults. PI_VC_device.py and CameraDevice.py are imported from their
+sibling ScopeFoundry Projects folders automatically (see hardware/*.py).
 """
 
 import sys
 import os
 import argparse
 
-# Make hardware/ and core/ importable from any working directory
+# Make hardware/, core/, ui/ importable from any working directory.
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
@@ -39,21 +40,22 @@ from PyQt5.QtCore import Qt
 
 from ui.main_window import MainWindow
 
+
 # ── Configuration ─────────────────────────────────────────────────────── #
 
 def make_mock_hardware():
-    """Return simulated stage + camera for UI development."""
+    """Simulated stage + camera for UI development (no devices needed)."""
     from hardware.camera import MockCamera
     from hardware.stage import MockPIStage
     camera = MockCamera(frame_x=2048, frame_y=2048, binning=1)
-    stage  = MockPIStage(axes=('1', '2', '3'))
+    stage = MockPIStage(axes=('1',))
     return camera, stage
 
 
 def make_real_hardware():
     """
-    Return real Hamamatsu + PI stage.
-    ▶  Edit serial numbers and camera parameters here.
+    Real Hamamatsu + PI stage.
+    ▶ Edit serial numbers / axis ids and camera defaults here.
     """
     from hardware.camera import HamamatsuCamera
     from hardware.stage import PIStageWrapper, StageManager
@@ -72,10 +74,10 @@ def make_real_hardware():
         subarrayv_pos=0,
     )
 
-    # ── Edit serial numbers to match your devices ──────────────── #
+    # ── Edit serial number(s) to match your devices ────────────── #
     stage = StageManager([
-        PIStageWrapper('0185500006', axis='1'),   # ← your serial here
-        # PIStageWrapper('0185500007', axis='2'), # uncomment for more axes
+        PIStageWrapper('0185500162', axis='1'),     # ← your serial here
+        # PIStageWrapper('0185500007', axis='2'),   # uncomment for more axes
     ])
 
     return camera, stage
@@ -84,7 +86,7 @@ def make_real_hardware():
 # ── Entry point ────────────────────────────────────────────────────────── #
 
 def main():
-    parser = argparse.ArgumentParser(description="Microscope Control App")
+    parser = argparse.ArgumentParser(description="Hyperspectral Control App")
     parser.add_argument('--real', action='store_true',
                         help="Use real hardware (default: simulation mode)")
     args = parser.parse_args()

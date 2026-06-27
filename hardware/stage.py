@@ -1,17 +1,23 @@
 """
-PI Stage wrapper — uses PI_VC_Device exactly as written in your existing code.
+PI Stage wrapper — forwards to PI_VC_Device exactly as in your existing code.
 
-Copy PI_VC_device.py into the hardware/ folder (or anywhere on sys.path),
-then set the serial number below.
+PI_VC_Device drives ONE axis per instance. Create one PIStageWrapper per axis
+and group them in a StageManager. The wrapper exposes the SAME functions as
+PI_VC_Device (move, position, velocity, home, servo, and the trigger functions
+used by the external-trigger hyperspectral scan), plus a non-blocking position
+read used to update the UI while a move is in progress.
+
+Conventions (identical to PI_VC_Device):
+    move_absolute  -> mm   (absolute target)
+    move_relative  -> um   (relative displacement)
+    get_position   -> mm   (waits on target, like the device)
 """
 
 import sys
 import os
 import time
 import threading
-import numpy as np
 
-# Allow importing PI_VC_device from the project root or hardware folder
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in [_HERE, os.path.join(_HERE, '..')]:
     if _p not in sys.path:
@@ -19,31 +25,30 @@ for _p in [_HERE, os.path.join(_HERE, '..')]:
 
 
 def add_path(path):
-    import sys
-    import os
-    # add path to ospath list, assuming that the path is in a sybling folder
-    from os.path import dirname
-    sys.path.append(os.path.abspath(os.path.join(dirname(dirname(__file__)),path)))
+    """Add a folder under the 'ScopeFoundry Projects' root to sys.path.
+
+    This file is at  <ScopeFoundry Projects>/HyperMeasurementApp/hardware/stage.py
+    so the projects root is three levels up; `path` (e.g. 'PI_ScopeFoundry') is a
+    sibling of HyperMeasurementApp.
+    """
+    here = os.path.abspath(__file__)
+    projects_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+    target = os.path.join(projects_root, path)
+    if not os.path.isdir(target):
+        print(f"[Stage] WARNING: expected device folder not found: {target}")
+    if target not in sys.path:
+        sys.path.append(target)
 
 
 class PIStageWrapper:
-    """
-    Thin wrapper around PI_VC_Device that adds:
-      - a connect() / disconnect() pattern for the UI
-      - thread-safe position polling
-      - the same dict-based API the rest of the app uses
-
-    Your PI_VC_Device takes one axis at construction time.
-    If you have multiple axes, instantiate one PIStageWrapper per axis
-    and pass a list to the StageManager below.
-    """
+    """Thin, thread-safe wrapper around a single-axis PI_VC_Device."""
 
     def __init__(self, serial: str, axis: str = '1'):
         self.serial = serial
         self.axis = axis
         self.motor = None          # PI_VC_Device instance, set after connect()
         self._connected = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ #
     #  Connection
@@ -77,55 +82,146 @@ class PIStageWrapper:
     def is_connected(self) -> bool:
         return self._connected
 
+    def get_info(self) -> str:
+        if self._connected:
+            with self._lock:
+                return self.motor.get_info()
+        return f"(axis {self.axis} not connected)"
+
     # ------------------------------------------------------------------ #
-    #  Position
+    #  Position / motion
     # ------------------------------------------------------------------ #
 
     def get_position(self) -> float:
-        """Returns position in mm (relative to home, as PI_VC_Device does)."""
+        """Position in mm (waits on target, exactly like PI_VC_Device)."""
         if not self._connected:
             return 0.0
         with self._lock:
             return self.motor.get_position()
 
-    def move_absolute(self, pos_mm: float, wait: bool = True):
-        """Move to absolute position in mm."""
+    def get_position_no_wait(self) -> float:
+        """
+        Position in mm WITHOUT waiting on target — for live UI updates while a
+        move is running. Reads qPOS directly (PI_VC_Device.get_position waits).
+
+        Locked: the GCS serial link is not thread-safe, so this must be
+        serialised against moves/reads issued by the scan worker, otherwise
+        interleaved commands corrupt the reply (qPOS throws -> returns 0).
+        """
+        if not self._connected:
+            return 0.0
+        try:
+            with self._lock:
+                pos = self.motor.pi_device.qPOS(self.motor.axis)[self.motor.axis]
+            return pos - self.motor.home
+        except Exception:
+            return 0.0
+
+    def move_absolute(self, pos_mm: float, wait: bool = True, correct_backslash: bool = False):
         if not self._connected:
             return
         with self._lock:
-            self.motor.move_absolute(pos_mm)
+            self.motor.move_absolute(pos_mm, correct_backslash=correct_backslash)
             if wait:
                 self.motor.wait_on_target()
 
-    def move_relative(self, delta_um: float, wait: bool = True):
-        """Move relative by delta_um (micrometres, matching your existing move_relative signature)."""
+    def move_relative(self, delta_um: float, wait: bool = True, correct_backslash: bool = False):
         if not self._connected:
             return
         with self._lock:
-            self.motor.move_relative(delta_um)   # PI_VC_Device.move_relative expects µm
+            self.motor.move_relative(delta_um, correct_backslash=correct_backslash)
             if wait:
+                self.motor.wait_on_target()
+
+    def wait_on_target(self):
+        if self._connected:
+            with self._lock:
                 self.motor.wait_on_target()
 
     def halt(self):
-        if self._connected and self.motor:
-            self.motor.stop()
+        if self._connected:
+            with self._lock:
+                self.motor.stop()
+
+    # ------------------------------------------------------------------ #
+    #  Home / reference / servo
+    # ------------------------------------------------------------------ #
 
     def set_home(self):
-        if self._connected and self.motor:
-            self.motor.set_home()
+        if self._connected:
+            with self._lock:
+                self.motor.set_home()
 
     def go_home(self):
-        if self._connected and self.motor:
-            self.motor.go_home()
+        if self._connected:
+            with self._lock:
+                self.motor.go_home()
+
+    def goto_ref_switch(self):
+        if self._connected:
+            with self._lock:
+                self.motor.gotoRefSwitch()
+
+    def set_servo(self, mode: bool):
+        if self._connected:
+            with self._lock:
+                self.motor.set_servo(mode)
+
+    def get_servo(self) -> bool:
+        if self._connected:
+            with self._lock:
+                return bool(self.motor.get_servo())
+        return False
+
+    def get_mode(self):
+        if self._connected:
+            with self._lock:
+                return self.motor.get_mode()
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  Velocity
+    # ------------------------------------------------------------------ #
 
     def get_velocity(self) -> float:
-        if self._connected and self.motor:
-            return self.motor.get_velocity()
+        if self._connected:
+            with self._lock:
+                return self.motor.get_velocity()
         return 0.0
 
     def set_velocity(self, v: float):
-        if self._connected and self.motor:
-            self.motor.set_velocity(v)
+        if self._connected:
+            with self._lock:
+                self.motor.set_velocity(v)
+
+    # ------------------------------------------------------------------ #
+    #  Trigger (used by the external-trigger hyperspectral scan)
+    # ------------------------------------------------------------------ #
+
+    def before_trigger(self):
+        if self._connected:
+            with self._lock:
+                self.motor.before_trigger()
+
+    def trigger(self, step, start, stop, ch, ch_tot):
+        if self._connected:
+            with self._lock:
+                self.motor.trigger(step, start, stop, ch, ch_tot)
+
+    def trigger_start(self, start, stop, ch, ch_tot):
+        if self._connected:
+            with self._lock:
+                self.motor.trigger_start(start, stop, ch, ch_tot)
+
+    def trigger_disable(self, ch_tot):
+        if self._connected:
+            with self._lock:
+                self.motor.trigger_disable(ch_tot)
+
+    def correct_backslash(self, displacement):
+        if self._connected:
+            with self._lock:
+                self.motor.correct_backslash(displacement)
 
 
 # ------------------------------------------------------------------ #
@@ -134,15 +230,11 @@ class PIStageWrapper:
 
 class StageManager:
     """
-    Groups one or more PIStageWrapper axes so the rest of the app can
-    treat them uniformly (dict of {axis_label: value}).
+    Groups one or more PIStageWrapper axes so the rest of the app can treat
+    them uniformly with a dict-based API ({axis_label: value}).
 
-    Example for a 3-axis system:
-        stage = StageManager([
-            PIStageWrapper('0185500001', axis='1'),
-            PIStageWrapper('0185500002', axis='2'),
-            PIStageWrapper('0185500003', axis='3'),
-        ])
+    For the hyperspectral scan, the measurement panel picks ONE axis and uses
+    its PIStageWrapper directly via get_wrapper(axis).
     """
 
     def __init__(self, wrappers: list):
@@ -167,14 +259,15 @@ class StageManager:
     def get_position(self) -> dict[str, float]:
         return {ax: w.get_position() for ax, w in self._wrappers.items()}
 
+    def get_position_no_wait(self) -> dict[str, float]:
+        return {ax: w.get_position_no_wait() for ax, w in self._wrappers.items()}
+
     def move_absolute(self, positions: dict[str, float], wait: bool = True):
-        """positions: {axis: mm_value}"""
         for ax, pos in positions.items():
             if ax in self._wrappers:
                 self._wrappers[ax].move_absolute(pos, wait=wait)
 
     def move_relative(self, deltas: dict[str, float], wait: bool = True):
-        """deltas: {axis: µm_value}  — matching PI_VC_Device.move_relative convention"""
         for ax, delta in deltas.items():
             if ax in self._wrappers:
                 self._wrappers[ax].move_relative(delta, wait=wait)
@@ -195,12 +288,92 @@ class StageManager:
 #  Mock stage (no hardware needed — for UI development)
 # ------------------------------------------------------------------ #
 
+class MockAxis:
+    """Single-axis mock mirroring PIStageWrapper's float (mm/um) API."""
+
+    def __init__(self, axis: str):
+        self.axis = axis
+        self._pos = 0.0          # mm
+        self._home = 0.0
+        self._velocity = 5.0
+        self._connected = True
+        self.motor = self        # so worker code that touches .motor still works
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def get_info(self) -> str:
+        return f"MockAxis {self.axis}"
+
+    def get_position(self) -> float:
+        return self._pos - self._home
+
+    def get_position_no_wait(self) -> float:
+        return self._pos - self._home
+
+    def move_absolute(self, pos_mm, wait=True, correct_backslash=False):
+        self._pos = self._home + pos_mm
+        if wait:
+            time.sleep(0.02)
+
+    def move_relative(self, delta_um, wait=True, correct_backslash=False):
+        self._pos += delta_um * 0.001
+        if wait:
+            time.sleep(0.02)
+
+    def wait_on_target(self):
+        time.sleep(0.01)
+
+    def halt(self):
+        pass
+
+    def set_home(self):
+        self._home = self._pos
+
+    def go_home(self):
+        self._pos = self._home
+        time.sleep(0.02)
+
+    def goto_ref_switch(self):
+        pass
+
+    def set_servo(self, mode):
+        pass
+
+    def get_servo(self) -> bool:
+        return True
+
+    def get_mode(self):
+        return True
+
+    def get_velocity(self) -> float:
+        return self._velocity
+
+    def set_velocity(self, v):
+        self._velocity = v
+
+    def before_trigger(self):
+        pass
+
+    def trigger(self, step, start, stop, ch, ch_tot):
+        pass
+
+    def trigger_start(self, start, stop, ch, ch_tot):
+        pass
+
+    def trigger_disable(self, ch_tot):
+        pass
+
+    def correct_backslash(self, displacement):
+        pass
+
+
 class MockPIStage:
     """Simulates a multi-axis PI stage for UI work without hardware."""
 
     def __init__(self, axes=('1', '2', '3')):
-        self._axes = list(axes)
-        self._pos = {ax: 0.0 for ax in axes}
+        self._axis_objs = {ax: MockAxis(ax) for ax in axes}
         self._connected = False
 
     def connect(self) -> bool:
@@ -217,30 +390,30 @@ class MockPIStage:
 
     @property
     def axes(self) -> list[str]:
-        return self._axes
+        return list(self._axis_objs.keys())
 
     def get_position(self) -> dict[str, float]:
-        return dict(self._pos)
+        return {ax: w.get_position() for ax, w in self._axis_objs.items()}
+
+    def get_position_no_wait(self) -> dict[str, float]:
+        return {ax: w.get_position_no_wait() for ax, w in self._axis_objs.items()}
 
     def move_absolute(self, positions: dict, wait=True):
-        self._pos.update(positions)
-        if wait:
-            time.sleep(0.05)
+        for ax, pos in positions.items():
+            if ax in self._axis_objs:
+                self._axis_objs[ax].move_absolute(pos, wait=wait)
 
     def move_relative(self, deltas: dict, wait=True):
         for ax, d in deltas.items():
-            # deltas are in µm, convert to mm for internal pos tracking
-            self._pos[ax] = self._pos.get(ax, 0.0) + d * 0.001
-        if wait:
-            time.sleep(0.05)
+            if ax in self._axis_objs:
+                self._axis_objs[ax].move_relative(d, wait=wait)
 
     def halt(self):
         pass
 
     def go_home(self):
-        for ax in self._axes:
-            self._pos[ax] = 0.0
-        time.sleep(0.1)
+        for w in self._axis_objs.values():
+            w.go_home()
 
-    def get_wrapper(self, axis):
-        return None   # not available in mock
+    def get_wrapper(self, axis: str) -> MockAxis:
+        return self._axis_objs[axis]

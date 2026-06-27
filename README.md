@@ -1,64 +1,91 @@
-# Hyperspectral Measurements Control App
+# Hyperspectral Control App
 
-PyQt5 desktop application for coordinated control of:
-- **Hamamatsu Orca Flash 4V3** camera (via DCAM4 / `CameraDevice.py`)
-- **PI motorised stage** (via `pipython` / `PI_VC_device.py`)
+Standalone PyQt5 desktop application for coordinated control of:
+- **Hamamatsu Orca Flash 4V3** camera (via DCAM4 / `CameraDevice.py` → `HamamatsuDevice`)
+- **PI motorised stage** (via `pipython` / `PI_VC_device.py` → `PI_VC_Device`)
+
+It reuses the *exact* device functions from your existing
+`Hyperspectral_System/hyperspectral_measure.py` system — no device behaviour is
+changed; the wrappers forward 1:1 to `PI_VC_Device` and `HamamatsuDevice`.
 
 ---
 
 ## Project structure
 
 ```
-microscope_app/
-├── main.py                  ← entry point
+HyperMeasurementApp/
+├── main.py                  ← entry point (--real for hardware, default = mock)
 ├── requirements.txt
 ├── hardware/
-│   ├── camera.py            ← HamamatsuCamera wrapper (uses CameraDevice.py)
-│   └── stage.py             ← PIStageWrapper + StageManager (uses PI_VC_device.py)
+│   ├── camera.py            ← HamamatsuCamera wrapper + MockCamera
+│   └── stage.py             ← PIStageWrapper + StageManager + MockPIStage
 ├── core/
-│   └── acquisition.py       ← QThread workers: live view, polling, jog, sequence
+│   └── acquisition.py       ← QThread workers (live, poller, jog, HyperSpectralWorker)
 └── ui/
-    ├── camera_panel.py      ← live feed, exposure, trigger
-    ├── stage_panel.py       ← per-axis readout, jog (µm), go-to (mm), velocity
-    ├── acquisition_panel.py ← position list, run sequence, save .npy
-    └── main_window.py       ← assembles all panels
+    ├── widgets.py           ← shared pyqtgraph ImageView helper
+    ├── camera_panel.py      ← exposure, binning, ROI, trigger, live view
+    ├── stage_panel.py       ← encoder read-back, to-go position, jog (µm), velocity
+    ├── measurement_panel.py ← hyperspectral scan + live image + interferogram plot
+    └── main_window.py       ← assembles & coordinates the three panels
 ```
+
+## The three panels
+
+1. **Camera** — exposure (s), binning (1/2/4), ROI/subarray (H/V size + position),
+   trigger source, live view and snap. ROI/binning are locked while live (the
+   camera must be idle to change them). Read-back shows model, internal frame
+   rate, and sensor temperature.
+2. **Stage** — per-axis current position (encoder read-back), an independent
+   "Go to" target (to-go position), relative jog in µm, velocity, set-home,
+   home, and HALT.
+3. **Measurement** — every parameter from `hyperspectral_measure.py`: scan axis,
+   `start_pos` (mm), `step` (µm), `step_num`, camera trigger (internal/external),
+   motor velocity (auto from exposure/ROI, or manual), refresh period, the
+   interferogram probe pixel, and HDF5 saving (sample name + directory). Shows
+   the live measurement image and the interferogram plot in tabs.
+
+## Multithreading
+
+All hardware I/O runs in background `QThread`s (`core/acquisition.py`) so the Qt
+event loop and the live image stay responsive. The hot paths are DCAM camera
+reads and PI GCS moves — both spend their time inside C-extension calls that
+release the Python GIL, so these threads run concurrently across cores. (Pure
+Python is still GIL-bound, but none of the hot paths here are pure Python.)
 
 ## Setup
 
-1. Copy `PI_VC_device.py` and `CameraDevice.py` into `microscope_app/`
-   (or any folder on `sys.path`).
+Use your existing `scopefoundry` conda environment (it already has PyQt5, numpy,
+pyqtgraph and h5py), or:
 
-2. Install dependencies:
-   ```
-   pip install PyQt5 numpy pipython
-   ```
-   The Hamamatsu camera requires the DCAM4 SDK installed on Windows.
+```
+pip install -r requirements.txt
+```
 
-3. Edit `main.py` → `make_real_hardware()`:
-   - Set the USB serial number(s) for your PI stage axis/axes.
-   - Adjust camera parameters (frame size, binning, exposure) if needed.
+Hardware drivers (Windows): the Hamamatsu **DCAM4 SDK** and the **PI GCS /
+pipython** USB drivers must be installed. `PI_VC_device.py` and
+`CameraDevice.py` are imported from their sibling `ScopeFoundry Projects`
+folders automatically.
 
 ## Running
 
 ```bash
-# Simulation mode (no hardware needed)
-python main.py
-
-# Real hardware
-python main.py --real
+python main.py            # simulation mode — no hardware needed
+python main.py --real     # real Hamamatsu + PI hardware
 ```
+
+For real hardware, edit `make_real_hardware()` in `main.py` (PI serial / axis
+and camera defaults).
 
 ## How the code maps to your existing scripts
 
 | Your code | This app |
 |---|---|
 | `PI_VC_Device(serial, axis)` | `PIStageWrapper.connect()` |
-| `motor.move_absolute(mm)` | stage jog "Go" button / acquisition worker |
-| `motor.move_relative(µm)` | stage jog ±step buttons |
-| `motor.wait_on_target()` | inside `JogWorker.run()` and `AcquisitionWorker.run()` |
-| `motor.set_velocity(v)` | "Apply" button in Stage panel |
-| `motor.set_home()` | "Set Home" button |
-| `hamamatsu.startAcquisition()` → `getLastFrame()` | `LiveViewWorker` (live preview) |
-| `hamamatsu.startAcquisition()` → `getLastFrame()` → `stopAcquisition()` | `camera.snap()` (per position) |
-| `hyperspectral_measure.measure()` internal-trigger loop | `AcquisitionWorker.run()` |
+| `motor.move_absolute(mm)` / `move_relative(µm)` | stage jog / "Go", scan worker |
+| `motor.set_velocity(v)` / `wait_on_target()` | velocity "Apply", inside workers |
+| `motor.trigger(...)` / `trigger_disable(...)` | external-trigger scan branch |
+| `hamamatsu.setExposure/setBinning/setSubarray*` | camera panel controls |
+| `startAcquisition → getLastFrame → stopAcquisition` | `LiveViewWorker`, internal scan |
+| `startAcquisition → getFrames → stopAcquisitionNotReleasing` | external-trigger scan |
+| `hyperspectral_measure.measure()` (internal + external) | `HyperSpectralWorker` |
+| `h5_io` image/position datasets | `HyperSpectralWorker._create_h5` (h5py) |

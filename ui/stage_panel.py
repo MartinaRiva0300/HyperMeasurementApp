@@ -1,6 +1,9 @@
 """
 StagePanel — position readout (mm), manual jog controls (µm steps),
 velocity setting, home and halt — all matching PI_VC_Device's API.
+
+Per axis: current position (encoder read-back), an independent "Go to" target
+(to-go position), and a relative jog step (µm).
 """
 
 from PyQt5.QtWidgets import (
@@ -14,15 +17,16 @@ class AxisJogWidget(QWidget):
     """
     One row of controls for a single PI axis.
 
-    Jog step is in µm (matching PI_VC_Device.move_relative which expects µm).
-    Go-to target is in mm (matching PI_VC_Device.move_absolute which expects mm).
-    Position readout is in mm.
+    Jog step is in µm (PI_VC_Device.move_relative expects µm).
+    Go-to target is in mm (PI_VC_Device.move_absolute expects mm).
+    Position read-back is in mm.
     """
 
     def __init__(self, axis_label: str, on_jog, parent=None):
         super().__init__(parent)
         self.axis_label = axis_label
         self.on_jog = on_jog
+        self._target_initialised = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -36,7 +40,7 @@ class AxisJogWidget(QWidget):
         lbl.setObjectName("axisLabel")
         row.addWidget(lbl)
 
-        # ── Position display (mm) ───────────────────────────────────
+        # ── Position display (mm) — encoder read-back ───────────────
         self.pos_label = QLabel("0.000000 mm")
         self.pos_label.setFixedWidth(110)
         self.pos_label.setObjectName("posDisplay")
@@ -62,7 +66,7 @@ class AxisJogWidget(QWidget):
         self.step_spin.setDecimals(3)
         self.step_spin.setSuffix(" µm")
         self.step_spin.setFixedWidth(100)
-        self.step_spin.setToolTip("Jog step size in micrometres")
+        self.step_spin.setToolTip("Relative jog step size in micrometres")
 
         self.btn_pos = QPushButton("+")
         self.btn_pos.setFixedSize(28, 28)
@@ -78,14 +82,14 @@ class AxisJogWidget(QWidget):
         sep2.setFrameShadow(QFrame.Sunken)
         row.addWidget(sep2)
 
-        # ── Go to absolute (mm) ────────────────────────────────────
+        # ── Go to absolute (mm) — the to-go position ────────────────
         row.addWidget(QLabel("Go to"))
         self.goto_spin = QDoubleSpinBox()
         self.goto_spin.setRange(-500.0, 500.0)
         self.goto_spin.setDecimals(6)
         self.goto_spin.setSuffix(" mm")
         self.goto_spin.setFixedWidth(120)
-        self.goto_spin.setToolTip("Absolute target position in mm")
+        self.goto_spin.setToolTip("Absolute target (to-go) position in mm")
 
         self.btn_goto = QPushButton("Go")
         self.btn_goto.setFixedWidth(38)
@@ -97,11 +101,15 @@ class AxisJogWidget(QWidget):
         row.addStretch()
 
     def update_position(self, value_mm: float):
+        # Encoder read-back only. The "Go to" target is independent — it is the
+        # user's to-go position and must not be overwritten by polling.
         self.pos_label.setText(f"{value_mm:.6f} mm")
-        # Keep goto in sync silently
-        self.goto_spin.blockSignals(True)
-        self.goto_spin.setValue(value_mm)
-        self.goto_spin.blockSignals(False)
+        if not self._target_initialised:
+            # Seed the to-go field with the current position the first time only.
+            self.goto_spin.blockSignals(True)
+            self.goto_spin.setValue(value_mm)
+            self.goto_spin.blockSignals(False)
+            self._target_initialised = True
 
     def set_enabled(self, enabled: bool):
         for w in [self.btn_neg, self.btn_pos, self.btn_goto,
@@ -110,12 +118,12 @@ class AxisJogWidget(QWidget):
 
     def _jog(self, direction: int):
         step_um = self.step_spin.value() * direction
-        # 'relative' -> µm (as PI_VC_Device.move_relative expects)
+        # 'relative' -> µm (PI_VC_Device.move_relative expects µm)
         self.on_jog('relative', {self.axis_label: step_um})
 
     def _goto(self):
         target_mm = self.goto_spin.value()
-        # 'absolute' -> mm (as PI_VC_Device.move_absolute expects)
+        # 'absolute' -> mm (PI_VC_Device.move_absolute expects mm)
         self.on_jog('absolute', {self.axis_label: target_mm})
 
 
@@ -127,6 +135,8 @@ class StagePanel(QWidget):
         self.stage = stage
         self._poller = None
         self._axis_widgets: dict[str, AxisJogWidget] = {}
+        # Optional hook the main window sets to be notified when the stage connects.
+        self.on_connected = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -181,7 +191,7 @@ class StagePanel(QWidget):
         self.vel_spin.setDecimals(4)
         self.vel_spin.setSuffix(" mm/s")
         self.vel_spin.setFixedWidth(110)
-        self.vel_spin.setToolTip("Stage velocity (applied to all axes individually via set_velocity)")
+        self.vel_spin.setToolTip("Stage velocity (applied to all axes via set_velocity)")
         self.btn_set_vel = QPushButton("Apply")
         self.btn_set_vel.setFixedWidth(55)
         self.btn_set_vel.setEnabled(False)
@@ -224,6 +234,8 @@ class StagePanel(QWidget):
                     self.vel_spin.setValue(w.get_velocity())
             except Exception:
                 pass
+            if callable(self.on_connected):
+                self.on_connected()
         else:
             self.stage_status.setText("Stage: connection FAILED — check serial number")
         return ok
@@ -272,12 +284,13 @@ class StagePanel(QWidget):
 
     def _go_home(self):
         from core.acquisition import JogWorker
-        # Use absolute move to 0.0 mm for each axis — same as PI_VC_Device.go_home()
+        # Absolute move to 0.0 mm on each axis — same as PI_VC_Device.go_home()
         pos = {ax: 0.0 for ax in self.stage.axes}
         worker = JogWorker(self.stage, 'absolute', pos)
         self.set_axes_enabled(False)
         worker.move_done.connect(lambda: self.set_axes_enabled(True))
         worker.start()
+        self._home_worker = worker  # keep a reference so it isn't GC'd
 
     def _set_home(self):
         """Calls motor.set_home() on each axis wrapper."""
@@ -310,6 +323,7 @@ class StagePanel(QWidget):
         worker.move_done.connect(lambda: self.set_axes_enabled(True))
         worker.error.connect(lambda msg: print(f"[Jog error] {msg}"))
         worker.start()
+        self._jog_worker = worker  # keep a reference so it isn't GC'd
 
     @pyqtSlot(dict)
     def _on_position_updated(self, pos: dict):

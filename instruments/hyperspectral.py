@@ -20,7 +20,7 @@ DEFAULT_N_STEPS = 100
 DEFAULT_APODIZATION = 0.2
 # Spectral window for the Forge 1GigE SWIR (Sony IMX990 SenSWIR, ~0.4-1.7 µm).
 # The useful upper edge is the sensor cut-off at 1.7 µm.
-DEFAULT_WL_START = 0.9       # µm
+DEFAULT_WL_START = 0.4       # µm
 DEFAULT_WL_STOP = 1.7        # µm
 
 DEFAULT_CALIBRATION_FILE = r".\Twins\calibration\parameters_cal.txt"
@@ -33,7 +33,7 @@ ZEROFILL_FACTOR = 1.5
 ZEROFILL_MIN = 512
 ZEROFILL_MAX = 4096
 
-# Centerburst (ZPD) search defaults (NIREOS TWINS wedge): the burst sits ~here
+# Centerburst (ZPD) search defaults: the burst sits ~here
 # with small run-to-run drift; detection is the envelope max within +/- window.
 DEFAULT_ZPD_MM = 24.33
 DEFAULT_ZPD_WINDOW_MM = 0.1
@@ -256,7 +256,7 @@ class HyperspectralProcessor:
                 from instruments.calibration import calibrate_position_axis
                 positions = np.asarray(calibrate_position_axis(positions), dtype=float)
             except Exception as e:  # noqa: BLE001
-                print(f"[WARN] KSpace: motor calibration skipped: {e}")
+                print(f"[WARN] Motor calibration skipped: {e}")
 
         # Walk-off correction: shift every frame back onto a common grid so each
         # pixel sees the same scene point across the scan (parametric rate from a
@@ -271,9 +271,9 @@ class HyperspectralProcessor:
                 if reference_cube is not None:
                     reference_cube = apply_walkoff_correction(
                         np.asarray(reference_cube, dtype=float), positions, ry, rx, rm)
-                print(f"[K-Space] walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
+                print(f" Walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
             except Exception as e:  # noqa: BLE001
-                print(f"[WARN] KSpace: walk-off correction skipped: {e}")
+                print(f"[WARN] Walk-off correction skipped: {e}")
 
         if invert:
             datacube = -datacube

@@ -58,6 +58,11 @@ from instruments.h5_writer import (
 # and sharing it makes the two apps overwrite each other's saved scan parameters.
 SETTINGS_ORG = "SWIR_CAMERA"
 
+# Half-width around ZPD that splits "center" from "tails" in the FT-region
+# selector. This was a UI spin box; it is now fixed -- change it here if the
+# centerburst of your interferograms is wider or narrower than this.
+DEFAULT_FT_WIDTH_MM = 0.10
+
 # Entries of the Measure tab's Format box.
 FORMAT_NPZ = "NumPy (.npz)"
 FORMAT_H5 = "HDF5 (.h5)"
@@ -688,15 +693,10 @@ class MeasurePanel(QWidget):
         self.combo_ftregion.setToolTip(
             "Which part of the interferogram to Fourier-transform (relative to ZPD):\n"
             "  full   = whole interferogram\n"
-            "  center = burst only (±width) -> broad spectral features\n"
-            "  tails  = wings only (beyond ±width) -> high-Q narrow resonances")
-        self.spin_ftwidth = QDoubleSpinBox()
-        self.spin_ftwidth.setRange(0.001, 50.0); self.spin_ftwidth.setDecimals(3)
-        self.spin_ftwidth.setSingleStep(0.01); self.spin_ftwidth.setValue(0.10)
-        self.spin_ftwidth.setSuffix(" mm")
-        self.spin_ftwidth.setToolTip("Half-width around ZPD separating center from tails.")
+            f"  center = burst only (±{DEFAULT_FT_WIDTH_MM:g} mm) -> broad spectral features\n"
+            f"  tails  = wings only (beyond ±{DEFAULT_FT_WIDTH_MM:g} mm) -> high-Q narrow "
+            "resonances")
         grid.addWidget(QLabel("FT region"), 8, 0); grid.addWidget(self.combo_ftregion, 8, 1)
-        grid.addWidget(QLabel("FT width (±ZPD)"), 9, 0); grid.addWidget(self.spin_ftwidth, 9, 1)
 
         # Apodization ZPD centre: an independent I² barycentre per pixel (DEFAULT
         # -- follows a zero-path position that varies across the field of view),
@@ -731,13 +731,6 @@ class MeasurePanel(QWidget):
         self.spin_sat.setToolTip("Saturation count level (14-bit full scale = 16383).")
         grid.addWidget(QLabel("Saturation level"), 1, 0); grid.addWidget(self.spin_sat, 1, 1)
 
-        self.chk_svd = QCheckBox("SVD denoise (low-rank)")
-        self.chk_svd.setToolTip("Keep the k strongest SVD components of the cube; "
-                                "removes spatially-incoherent noise.")
-        grid.addWidget(self.chk_svd, 2, 0, 1, 2)
-        self.spin_svd_k = QSpinBox(); self.spin_svd_k.setRange(1, 64); self.spin_svd_k.setValue(6)
-        self.spin_svd_k.setToolTip("Number of spectral components to keep.")
-        grid.addWidget(QLabel("Components (k)"), 3, 0); grid.addWidget(self.spin_svd_k, 3, 1)
         return g
 
     def _build_walkoff_group(self) -> QGroupBox:
@@ -888,13 +881,11 @@ class MeasurePanel(QWidget):
             "ks_wo_y": (self.spin_wo_y, float),
             "ks_wo_x": (self.spin_wo_x, float),
             "ks_sat_level": (self.spin_sat, int),
-            "ks_svd_k": (self.spin_svd_k, int),
-            "ks_ftwidth": (self.spin_ftwidth, float),
         }
 
     def _persisted_checks(self) -> dict:
         """key -> checkbox widgets persisted between measurements."""
-        return {"ks_sat_on": self.chk_sat, "ks_svd_on": self.chk_svd}
+        return {"ks_sat_on": self.chk_sat}
 
     def _restore_settings(self) -> None:
         for key, (widget, cast) in self._persisted_spins().items():
@@ -1019,8 +1010,8 @@ class MeasurePanel(QWidget):
             walkoff=walkoff,
             background=bg, bg_subtract=bool(bg_sub and bg is not None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            svd_on=self.chk_svd.isChecked(), svd_k=self.spin_svd_k.value(),
-            ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
+            ft_region=self.combo_ftregion.currentText(),
+            ft_width=DEFAULT_FT_WIDTH_MM,
             center_method=self._center_method(),
         )
         # Capture scan parameters as metadata (no arrays) for the saved hypercube.
@@ -1036,7 +1027,6 @@ class MeasurePanel(QWidget):
             n_freq_setting=params["nfreq"], expected_zpd_mm=DEFAULT_ZPD_MM,
             walkoff=walkoff, background_subtracted=params["bg_subtract"],
             saturation_masking=params["sat_on"], saturation_level=params["sat_level"],
-            svd_denoise=params["svd_on"], svd_k=params["svd_k"],
             ft_region=params["ft_region"], ft_width_mm=params["ft_width"],
             apod_center=params["center_method"],
             filename=self.edit_filename.text().strip() or "kspace",
@@ -1142,8 +1132,8 @@ class MeasurePanel(QWidget):
             walkoff=(dict(rate_y=self.spin_wo_y.value(), rate_x=self.spin_wo_x.value())
                      if self.chk_walkoff.isChecked() else None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            svd_on=self.chk_svd.isChecked(), svd_k=self.spin_svd_k.value(),
-            ft_region=self.combo_ftregion.currentText(), ft_width=self.spin_ftwidth.value(),
+            ft_region=self.combo_ftregion.currentText(),
+            ft_width=DEFAULT_FT_WIDTH_MM,
             center_method=self._center_method(),
         )
         # Keep the saved metadata in step with what was recomputed.
@@ -1152,7 +1142,7 @@ class MeasurePanel(QWidget):
             apodization=p["apod_type"], apod_width=p["apod"],
             wl_start_um=p["wl0"], wl_stop_um=p["wl1"], n_freq_setting=p["nfreq"],
             apod_center=p["center_method"],
-            svd_denoise=p["svd_on"], svd_k=p["svd_k"], recomputed=True)
+            recomputed=True)
         self.btn_run.setEnabled(False)
         self.btn_recompute.setEnabled(False)
         self.lbl_status.setText(f"recomputing from raw (FT={p['ft_region']})...")
@@ -1160,7 +1150,7 @@ class MeasurePanel(QWidget):
 
     def _recompute_worker(self, p: dict) -> None:
         try:
-            from instruments.analysis import saturation_mask, svd_denoise
+            from instruments.analysis import saturation_mask
             proc = HyperspectralProcessor()
             cubes, masks, wls = [], [], None
             for positions, datacube in zip(self.raw_positions, self.raw_cubes):
@@ -1181,8 +1171,6 @@ class MeasurePanel(QWidget):
                     center_method=p["center_method"])
                 if cube is None:
                     continue
-                if p["svd_on"]:
-                    cube = svd_denoise(cube, p["svd_k"])
                 wls = wl
                 cubes.append(cube)
                 masks.append(sat_mask)
@@ -1221,7 +1209,7 @@ class MeasurePanel(QWidget):
 
     def _worker(self, p: dict) -> None:
         try:
-            from instruments.analysis import saturation_mask, svd_denoise
+            from instruments.analysis import saturation_mask
             from instruments.subtwinslv import bin_image
             scanner = TwinsScanner(self.sp.twins, self.frame_source)
             proc = HyperspectralProcessor()
@@ -1300,9 +1288,6 @@ class MeasurePanel(QWidget):
                     center_method=p["center_method"])
                 if cube is None:
                     continue
-                if p["svd_on"]:
-                    self.sig_status.emit(f"SVD denoise (k={p['svd_k']})...")
-                    cube = svd_denoise(cube, p["svd_k"])
                 wls = wl
                 cubes.append(cube)
                 # No Z / angle axis in this app -> the viewer's delay slider stays

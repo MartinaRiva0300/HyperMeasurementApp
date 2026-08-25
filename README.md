@@ -28,7 +28,6 @@ cube.
 - Forge GenICam options exposed directly: `ExposureAuto`, `GainAuto`,
   `PixelFormat`, `AdcBitDepth`, `AcquisitionFrameRate`.
 - On-image draggable **ROI** + binning, shared by the measurement panels.
-- Software **bad-pixel mask** (auto-detect, paint, save/load).
 
 **TWINS**
 - Connect / go-to / jog for the SLC-1750 wedge stage, with a no-hardware
@@ -38,9 +37,9 @@ cube.
 **Hyperspectral measurement (Measure tab)**
 - Steps the TWINS wedge, grabs frame stacks, computes a **per-pixel DFT** →
   spectral cube, motor-nonlinearity calibrated, auto-saved on completion.
-- Apodization, FT region/width, ZPD centring, walk-off correction, saturation
-  masking, SVD denoise, and a **Recompute** button that re-runs the DFT on the
-  stored raw interferogram with new settings — no re-scan.
+- Apodization, FT region, ZPD centring, walk-off correction, saturation
+  masking, and a **Recompute** button that re-runs the DFT on the stored raw
+  interferogram with new settings — no re-scan.
 - **Save format** selectable per run: NumPy `.npz` (default) or **HDF5** in the
   ScopeFoundry layout — see below.
 - Built-in **HyperViewer**: λ-scrub / peak-λ / peak-intensity / SAM /

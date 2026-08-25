@@ -37,9 +37,27 @@ cube.
 **Hyperspectral measurement (Measure tab)**
 - Steps the TWINS wedge, grabs frame stacks, computes a **per-pixel DFT** →
   spectral cube, motor-nonlinearity calibrated, auto-saved on completion.
-- Apodization, FT region, ZPD centring, walk-off correction, saturation
-  masking, and a **Recompute** button that re-runs the DFT on the stored raw
-  interferogram with new settings — no re-scan.
+- The **whole acquired interferogram** is always transformed. Apodization type
+  and width, apodization-centre method, walk-off correction, saturation masking,
+  and a **Recompute** button that re-runs the DFT on the stored raw interferogram
+  with new settings — no re-scan.
+- **Apod centre** picks where the apodization window sits:
+  - `barycentre (per-pixel)` — each pixel's own I² centroid (default), so a ZPD
+    that drifts across the field is followed pixel by pixel;
+  - `envelope (field)` — one Hilbert-envelope centre-burst for the whole frame;
+  - `geometric centre` — the midpoint sample of the scan, ignoring the signal
+    entirely (use when the scan is already deliberately centred on ZPD).
+
+  The first two are found from the acquired data — no expected ZPD position is
+  assumed. The acquisition never phase-corrects; that stays in `analysis_app.py`.
+- **Save complex spectrum (keep phase)** — writes the cube as `complex64`
+  (**float32 real + float32 imag**), keeping the interferometric phase alongside
+  the amplitude instead of the `float32` magnitude alone. The precision is
+  float32 either way; the cube grows from 4 to 8 bytes per element only because
+  two numbers are stored per element instead of one — that is the smallest form
+  that can carry phase. Both save paths pin the dtype to `complex64`, so nothing
+  can upcast to `complex128`. The viewer, the maps and the ROI-average CSV always
+  display `|spectrum|`, so nothing changes on screen. Off by default.
 - **Save format** selectable per run: NumPy `.npz` (default) or **HDF5** in the
   ScopeFoundry layout — see below.
 - Built-in **HyperViewer**: λ-scrub / peak-λ / peak-intensity / SAM /
@@ -59,19 +77,30 @@ ROI-average CSV is unaffected by it.
 This is what `analysis_app.py`, `view_hyperspectral.py` and the Measure tab's own
 Load button read, so leave it selected unless you specifically need HDF5.
 
-**HDF5 `.h5`** — `<yymmdd_HHMMSS>_hyperspectral[_<filename>].h5`, written in the
+**HDF5 `.h5`** — `<yymmdd_HHMMSS>_hyper[_<filename>].h5`, written in the
 ScopeFoundry `h5_io` layout so the lab's other tooling can read it. The Filename
 box supplies the **sample** name; the timestamp is taken from the run stamp so
 the file and its run folder always agree.
 
+The measurement group is **`hyper`** (`MEASUREMENT_NAME` in
+`instruments/h5_writer.py`), matching the MATLAB reader's
+`/measurement/hyper/t0/c0/`. Renaming it breaks that reader.
+
+**Units:** the app works in millimetres internally, but the HDF5 position
+datasets are written in **micrometres** — that is what the MATLAB reader expects.
+The datasets keep their historical `position_mm` *name* (the reader opens that
+path) while holding µm *values*, so every one carries an explicit `units` attr to
+remove the ambiguity. The conversion happens only at the HDF5 write boundary; the
+`.npz` format still stores millimetres in `raw_positions`.
+
 ```
 /                                    attrs: created, time_id, sample, measurement
 /app/settings                        attrs: save_dir, sample
-/measurement/hyperspectral/
+/measurement/hyper/
     settings/                        every scan setting, as attributes
     t0/c0/image                      (n_pos, h, w)  the raw interferogram
                                      attrs: element_size_um = [z, y, x]
-    t0/c0/position_mm                (n_pos,) float32  measured wedge axis
+    t0/c0/position_mm                (n_pos,) float32  wedge axis in MICROMETRES
     t0/c0/position_mm_calibrated     (n_pos,) the axis the DFT actually used
     spectrum/wavelengths             (n_freq,) µm
     spectrum/cube                    (1, n_freq, h, w) float32
@@ -120,6 +149,7 @@ instruments/          drivers + shared DSP
   calibration.py dsp.py analysis.py walkoff.py   shared processing
 Twins/calibration/      parameters_{cal,int}.txt  spectral + motor calibration
 selftest_acquisition.py  headless mock-camera + simulated-stage acquisition test
+dump_h5_layout.py     print the exact HDF5 layout a measurement produces
 docs/                 ACQUISITION_APP.md (architecture) + CONTINUUM_SUBTRACTION.md
 ```
 
@@ -164,20 +194,22 @@ analyze.bat                                   REM standalone analyzer
 
 ## Before the first real measurement
 
-Three things in this repo are carried over from the MWIR rig and **must be set
-for this instrument** — the app will run without them, but the wavelength axis
-will be wrong:
+Two things in this repo are carried over from the MWIR rig and **must be set for
+this instrument**:
 
 1. **`Twins/calibration/parameters_cal.txt`** covers **1.50–15.79 µm**, i.e.
    it is the MWIR/LWIR TWINS calibration and only overlaps the SWIR band above
-   1.5 µm. Replace it with the calibration for the TWINS unit used here.
-2. **`DEFAULT_ZPD_MM = 24.33`** (`instruments/hyperspectral.py`) is the MWIR
-   rig's zero-path-difference wedge position. Find the ZPD for this
-   interferometer and set it, along with the default scan Start/Stop.
-3. **`HOME_POSITION_MM` / `SAFE_POSITION_MM` / `TRAVEL_MM`**
+   1.5 µm. Replace it with the calibration for the TWINS unit used here, or the
+   wavelength axis will be wrong.
+2. **`HOME_POSITION_MM` / `SAFE_POSITION_MM` / `TRAVEL_MM`**
    (`instruments/twins_stage.py`) are placeholders — `TRAVEL_MM = 50.0` assumes a
    50 mm SLC-1750. Check the label on the positioner and set the park positions
    to match your wedge mount.
+
+You still need to know roughly where ZPD is in order to choose the scan
+Start/Stop, but the app no longer assumes a value: the apodization centre is
+located in whatever you acquired. (`DEFAULT_ZPD_MM = 24.33` survives in
+`instruments/hyperspectral.py` only for `analysis_app.py`.)
 
 Nyquist also bites harder in SWIR than MWIR: resolving 0.9 µm needs a far finer
 wedge step than 4 µm did. The Measure tab shows the maximum permitted step and

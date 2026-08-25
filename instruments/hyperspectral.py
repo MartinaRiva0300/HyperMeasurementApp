@@ -20,7 +20,7 @@ DEFAULT_N_STEPS = 100
 DEFAULT_APODIZATION = 0.2
 # Spectral window for the Forge 1GigE SWIR (Sony IMX990 SenSWIR, ~0.4-1.7 µm).
 # The useful upper edge is the sensor cut-off at 1.7 µm.
-DEFAULT_WL_START = 0.4       # µm
+DEFAULT_WL_START = 0.9       # µm
 DEFAULT_WL_STOP = 1.7        # µm
 
 DEFAULT_CALIBRATION_FILE = r".\Twins\calibration\parameters_cal.txt"
@@ -33,7 +33,7 @@ ZEROFILL_FACTOR = 1.5
 ZEROFILL_MIN = 512
 ZEROFILL_MAX = 4096
 
-# Centerburst (ZPD) search defaults: the burst sits ~here
+# Centerburst (ZPD) search defaults (NIREOS TWINS wedge): the burst sits ~here
 # with small run-to-run drift; detection is the envelope max within +/- window.
 DEFAULT_ZPD_MM = 24.33
 DEFAULT_ZPD_WINDOW_MM = 0.1
@@ -222,15 +222,22 @@ class HyperspectralProcessor:
                                expected_zero_mm=None, search_mm=None,
                                apod_type="gaussian", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
-                               positions_calibrated=False, center_method="envelope"):
+                               positions_calibrated=False, center_method="envelope",
+                               complex_output=False):
         """
         Compute per-pixel DFT on a (n_pos, h, w) datacube.
 
-        `center_method`: how the apodization ZPD centre is found --
+        `center_method`: where the apodization window is centred --
         "envelope" (default) = one Hilbert-envelope centre-burst for the whole
         field (signed spatial sum); "barycenter" = an independent I^2 barycentre
-        per pixel, so a ZPD that varies across the field is followed per pixel.
+        per pixel, so a ZPD that varies across the field is followed per pixel;
+        "geometric" = the midpoint sample of the acquired scan, ignoring the
+        signal entirely (use when the scan is deliberately centred on ZPD).
         If reference_cube is provided, extracts spectral phase and returns the Absorptive (Real) part.
+
+        `complex_output`: keep the COMPLEX DFT instead of its magnitude, so the
+        interferometric phase survives into the saved cube (complex64). Default
+        False = |spectrum| as float32, the historical behaviour.
 
         `positions_calibrated`: set True when `positions` is ALREADY the
         motor-corrected axis (e.g. reloaded from a saved file's
@@ -256,7 +263,7 @@ class HyperspectralProcessor:
                 from instruments.calibration import calibrate_position_axis
                 positions = np.asarray(calibrate_position_axis(positions), dtype=float)
             except Exception as e:  # noqa: BLE001
-                print(f"[WARN] Motor calibration skipped: {e}")
+                print(f"[WARN] KSpace: motor calibration skipped: {e}")
 
         # Walk-off correction: shift every frame back onto a common grid so each
         # pixel sees the same scene point across the scan (parametric rate from a
@@ -271,9 +278,9 @@ class HyperspectralProcessor:
                 if reference_cube is not None:
                     reference_cube = apply_walkoff_correction(
                         np.asarray(reference_cube, dtype=float), positions, ry, rx, rm)
-                print(f" Walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
+                print(f"[K-Space] walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
             except Exception as e:  # noqa: BLE001
-                print(f"[WARN] Walk-off correction skipped: {e}")
+                print(f"[WARN] KSpace: walk-off correction skipped: {e}")
 
         if invert:
             datacube = -datacube
@@ -282,7 +289,8 @@ class HyperspectralProcessor:
 
         sym_flag = hasattr(self, 'chk_asymmetric') and self.chk_asymmetric.isChecked()
 
-        per_pixel = str(center_method).lower().startswith("bary")
+        _method = str(center_method).lower()
+        per_pixel = _method.startswith("bary")
 
         # Helper for baseline & apodization
         def preprocess(cube, force_center=None, c_pos=None):
@@ -303,6 +311,11 @@ class HyperspectralProcessor:
                 center = force_center
             elif per_pixel:
                 center = barycenter_map(sig)                 # (h, w) index map
+            elif _method.startswith("geom"):
+                # Geometrical centre of the acquired interferogram: the midpoint
+                # sample. Derived from the scan geometry alone -- no burst search,
+                # no dependence on signal quality.
+                center = len(c_pos) // 2
             else:
                 # Collapse to a 1-D interferogram by SIGNED spatial sum (the
                 # common-path fringe phase is shared across the field, so signed
@@ -422,13 +435,17 @@ class HyperspectralProcessor:
 
             phase_correction = np.angle(ref_spec_flat)
             phased_spec_flat = spec_flat * np.exp(-1j * phase_correction)
-            spectrum_cube = np.real(phased_spec_flat).reshape(n_freq, h, w)
+            flat_out = (phased_spec_flat if complex_output
+                        else np.real(phased_spec_flat))
         else:
-            spectrum_cube = np.abs(spec_flat).reshape(n_freq, h, w)
+            flat_out = spec_flat if complex_output else np.abs(spec_flat)
+        spectrum_cube = flat_out.reshape(n_freq, h, w)
 
         # Magnitude/absorptive spectra don't need float64 -- float32 halves the
-        # cube size in RAM and on disk with no meaningful precision loss.
-        return wavelengths, spectrum_cube.astype(np.float32)
+        # cube size in RAM and on disk with no meaningful precision loss. The
+        # complex form keeps the phase, at 2x the size of the float32 magnitude.
+        return wavelengths, spectrum_cube.astype(
+            np.complex64 if complex_output else np.float32)
 
     def compute_complex_map(self, positions, datacube, wavelength_um,
                             apod_width=0.2, apod_type="gaussian",
@@ -483,8 +500,11 @@ class HyperspectralProcessor:
         # ZPD centre: one field-wide envelope value, or an independent per-pixel
         # barycentre map (same choice as compute_hyperspectral, kept in step so
         # the phase view matches the recomputed cube).
-        if str(center_method).lower().startswith("bary"):
+        _cm = str(center_method).lower()
+        if _cm.startswith("bary"):
             center = barycenter_map(burst_src)             # (h, w) index map
+        elif _cm.startswith("geom"):
+            center = len(positions) // 2                   # geometrical midpoint
         else:
             center = find_centerburst(np.sum(burst_src, axis=(1, 2)), positions,
                                       expected_zero_mm, search_mm)

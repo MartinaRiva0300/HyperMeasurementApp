@@ -53,26 +53,20 @@ from instruments.subtwinslv import TwinsScanner
 from instruments.h5_writer import (
     h5_filename, load_measurement_h5, save_measurement_h5,
 )
+from instruments.hyperspectral import (
+    HyperspectralProcessor, DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS,
+    DEFAULT_APODIZATION, DEFAULT_WL_START, DEFAULT_WL_STOP,
+    ZEROFILL_FACTOR, ZEROFILL_MIN, ZEROFILL_MAX, resolve_n_points,
+)
+from instruments.dsp import APOD_TYPES
 
 # QSettings scope. Deliberately NOT "MIR_CAMERA" -- that is the MWIR app's scope,
 # and sharing it makes the two apps overwrite each other's saved scan parameters.
 SETTINGS_ORG = "SWIR_CAMERA"
 
-# Half-width around ZPD that splits "center" from "tails" in the FT-region
-# selector. This was a UI spin box; it is now fixed -- change it here if the
-# centerburst of your interferograms is wider or narrower than this.
-DEFAULT_FT_WIDTH_MM = 0.10
-
 # Entries of the Measure tab's Format box.
 FORMAT_NPZ = "NumPy (.npz)"
 FORMAT_H5 = "HDF5 (.h5)"
-from instruments.hyperspectral import (
-    HyperspectralProcessor, DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS,
-    DEFAULT_APODIZATION, DEFAULT_WL_START, DEFAULT_WL_STOP,
-    ZEROFILL_FACTOR, ZEROFILL_MIN, ZEROFILL_MAX, resolve_n_points,
-    DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM,
-)
-from instruments.dsp import APOD_TYPES
 
 
 # grey and jet aren't bundled in pyqtgraph and need matplotlib (absent here), so
@@ -481,7 +475,9 @@ def load_kspace_npz(path: str):
     if "wavelengths" not in d or "spectrum_cubes" not in d:
         return None
     wl = np.asarray(d["wavelengths"])
-    cubes = [np.asarray(c) for c in d["spectrum_cubes"]]
+    # A cube saved in complex form is displayed as its magnitude.
+    cubes = [np.abs(c) if np.iscomplexobj(c) else np.asarray(c)
+             for c in d["spectrum_cubes"]]
     zv = d["z_values"] if "z_values" in d else np.full(len(cubes), np.nan)
     z_values = [None if np.isnan(v) else float(v) for v in np.asarray(zv).ravel()]
     masks = None
@@ -531,7 +527,10 @@ class MeasurePanel(QWidget):
         self._low_disk_warned = False
         self.viewer = None
         self.wavelengths = None
-        self.cubes = []
+        self.cubes = []                        # ALWAYS real (magnitude) -- display
+        # Complex spectra, populated only when "Save complex spectrum" is on.
+        # The saved file uses these; every display path uses self.cubes.
+        self.complex_cubes = []
         self.z_values = []
         self.sat_masks = []
         # Raw interferogram cubes + positions (per z), kept for optional saving
@@ -568,7 +567,6 @@ class MeasurePanel(QWidget):
         for widget, _cast in self._persisted_spins().values():
             widget.valueChanged.connect(self._save_settings)
         self.combo_apod.currentTextChanged.connect(self._save_settings)
-        self.combo_ftregion.currentTextChanged.connect(self._save_settings)
         self.chk_walkoff.toggled.connect(self._save_settings)
         self.combo_save.currentTextChanged.connect(self._save_settings)
         self.combo_format.currentTextChanged.connect(self._save_settings)
@@ -687,36 +685,48 @@ class MeasurePanel(QWidget):
         grid.addWidget(QLabel("Resolution"), 6, 0); grid.addWidget(self.lbl_resolution, 6, 1)
         grid.addWidget(QLabel("Max step (5/cyc)"), 7, 0); grid.addWidget(self.lbl_min_step, 7, 1)
 
-        # FT window: which part of the interferogram to transform.
-        self.combo_ftregion = QComboBox()
-        self.combo_ftregion.addItems(["full", "center", "tails"])
-        self.combo_ftregion.setToolTip(
-            "Which part of the interferogram to Fourier-transform (relative to ZPD):\n"
-            "  full   = whole interferogram\n"
-            f"  center = burst only (±{DEFAULT_FT_WIDTH_MM:g} mm) -> broad spectral features\n"
-            f"  tails  = wings only (beyond ±{DEFAULT_FT_WIDTH_MM:g} mm) -> high-Q narrow "
-            "resonances")
-        grid.addWidget(QLabel("FT region"), 8, 0); grid.addWidget(self.combo_ftregion, 8, 1)
-
-        # Apodization ZPD centre: an independent I² barycentre per pixel (DEFAULT
-        # -- follows a zero-path position that varies across the field of view),
-        # or one field-wide envelope centre-burst (signed spatial sum).
+        # Apodization ZPD centre. The WHOLE acquired interferogram is always
+        # transformed, so this only sets where the apodization window is centred:
+        # an independent I² barycentre per pixel (DEFAULT -- follows a zero-path
+        # position that varies across the field of view), or one field-wide
+        # envelope centre-burst (signed spatial sum). Either way the centre comes
+        # from the acquired data; no expected-ZPD position is assumed.
         self.combo_center = QComboBox()
-        self.combo_center.addItems(["barycentre (per-pixel)", "envelope (field)"])
+        self.combo_center.addItems(["barycentre (per-pixel)", "envelope (field)",
+                                    "geometric centre"])
         self.combo_center.setCurrentText("barycentre (per-pixel)")
         self.combo_center.setToolTip(
-            "How the apodization centre (ZPD) is located:\n"
+            "How the apodization centre (ZPD) is located in the acquired scan:\n"
             "  barycentre (per-pixel) = each pixel's own I² centroid (default)\n"
-            "  envelope (field)       = one centre-burst for the whole frame")
+            "  envelope (field)       = one centre-burst for the whole frame\n"
+            "  geometric centre       = the midpoint sample of the scan, ignoring\n"
+            "                           the signal (use when the scan is already\n"
+            "                           centred on ZPD)")
         self.combo_center.currentTextChanged.connect(self._save_settings)
-        grid.addWidget(QLabel("Apod centre"), 10, 0); grid.addWidget(self.combo_center, 10, 1)
+        grid.addWidget(QLabel("Apod centre"), 8, 0); grid.addWidget(self.combo_center, 8, 1)
+
+        # Keep the complex DFT instead of its magnitude. The viewer and the
+        # ROI-average CSV still show |spectrum|; only the SAVED cube differs.
+        self.chk_complex = QCheckBox("Save complex spectrum (keep phase)")
+        self.chk_complex.setToolTip(
+            "Save the cube as complex64 -- float32 real + float32 imag -- so the "
+            "interferometric PHASE is kept alongside the amplitude, instead of "
+            "the float32 magnitude alone.\n"
+            "Same float32 precision either way; the file grows only because two "
+            "numbers per element are stored instead of one (8 vs 4 bytes).\n"
+            "The viewer, the maps and the ROI-average CSV always display "
+            "|spectrum|, so nothing changes on screen.")
+        self.chk_complex.toggled.connect(self._save_settings)
+        grid.addWidget(self.chk_complex, 9, 0, 1, 2)
         return g
 
     def _center_method(self) -> str:
         """Apodization-centre method for the processor: 'barycenter' (per-pixel,
-        default) or 'envelope' (field-wide)."""
-        return ("barycenter" if self.combo_center.currentText().startswith("bary")
-                else "envelope")
+        default), 'envelope' (field-wide) or 'geometric' (scan midpoint)."""
+        text = self.combo_center.currentText()
+        if text.startswith("bary"):
+            return "barycenter"
+        return "geometric" if text.startswith("geom") else "envelope"
 
     def _build_postproc_group(self) -> QGroupBox:
         g = QGroupBox("Post-processing")
@@ -806,8 +816,8 @@ class MeasurePanel(QWidget):
         self.btn_recompute = QPushButton("Recompute")
         self.btn_recompute.clicked.connect(self._recompute)
         self.btn_recompute.setToolTip("Re-run the DFT on the LAST scan's raw "
-                                      "interferogram with the current settings (FT region, "
-                                      "apodization, λ, denoise) -- no re-scan.")
+                                      "interferogram with the current settings (apodization "
+                                      "type/width, apod centre, λ window, N freq) -- no re-scan.")
         self.btn_view = QPushButton("Open Viewer"); self.btn_view.clicked.connect(self._open_viewer)
         self.btn_load = QPushButton("Load"); self.btn_load.clicked.connect(self._load)
         self.btn_load.setToolTip("Open a saved K-space .npz in the viewer.")
@@ -885,7 +895,7 @@ class MeasurePanel(QWidget):
 
     def _persisted_checks(self) -> dict:
         """key -> checkbox widgets persisted between measurements."""
-        return {"ks_sat_on": self.chk_sat}
+        return {"ks_sat_on": self.chk_sat, "ks_complex": self.chk_complex}
 
     def _restore_settings(self) -> None:
         for key, (widget, cast) in self._persisted_spins().items():
@@ -899,9 +909,6 @@ class MeasurePanel(QWidget):
         apod = self._settings.value("ks_apod_type", None)
         if apod is not None:
             self.combo_apod.setCurrentText(str(apod))
-        ftr = self._settings.value("ks_ftregion", None)
-        if ftr is not None:
-            self.combo_ftregion.setCurrentText(str(ftr))
         ctr = self._settings.value("ks_apod_center", None)
         if ctr is not None:
             self.combo_center.setCurrentText(str(ctr))
@@ -926,7 +933,6 @@ class MeasurePanel(QWidget):
         for key, (widget, _cast) in self._persisted_spins().items():
             self._settings.setValue(key, widget.value())
         self._settings.setValue("ks_apod_type", self.combo_apod.currentText())
-        self._settings.setValue("ks_ftregion", self.combo_ftregion.currentText())
         self._settings.setValue("ks_apod_center", self.combo_center.currentText())
         self._settings.setValue("ks_walkoff_on", self.chk_walkoff.isChecked())
         self._settings.setValue("ks_save_mode", self.combo_save.currentText())
@@ -1010,9 +1016,8 @@ class MeasurePanel(QWidget):
             walkoff=walkoff,
             background=bg, bg_subtract=bool(bg_sub and bg is not None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            ft_region=self.combo_ftregion.currentText(),
-            ft_width=DEFAULT_FT_WIDTH_MM,
             center_method=self._center_method(),
+            complex_out=self.chk_complex.isChecked(),
         )
         # Capture scan parameters as metadata (no arrays) for the saved hypercube.
         nsteps = params["n"]
@@ -1024,11 +1029,12 @@ class MeasurePanel(QWidget):
             roi=list(roi) if roi is not None else None,
             apodization=params["apod_type"], apod_width=params["apod"],
             wl_start_um=params["wl0"], wl_stop_um=params["wl1"],
-            n_freq_setting=params["nfreq"], expected_zpd_mm=DEFAULT_ZPD_MM,
+            n_freq_setting=params["nfreq"],
             walkoff=walkoff, background_subtracted=params["bg_subtract"],
             saturation_masking=params["sat_on"], saturation_level=params["sat_level"],
-            ft_region=params["ft_region"], ft_width_mm=params["ft_width"],
+            ft_region="full",
             apod_center=params["center_method"],
+            complex_spectrum=params["complex_out"],
             filename=self.edit_filename.text().strip() or "kspace",
         )
         # Each Acquire = one experiment "run": save ALL its files into a folder
@@ -1120,8 +1126,9 @@ class MeasurePanel(QWidget):
 
     def _recompute(self) -> None:
         """Re-run the DFT on the last scan's RAW interferogram with the current
-        settings (FT region, apodization, λ, denoise) -- no re-scan. Lets you
-        compare e.g. center vs tails on already-acquired data."""
+        settings (apodization type/width, apod centre, λ window, N freq) -- no
+        re-scan. Lets you compare e.g. barycentre vs envelope centring on
+        already-acquired data."""
         if not getattr(self, "raw_cubes", None):
             self.lbl_status.setText("no raw data to recompute -- run a scan first")
             return
@@ -1132,20 +1139,21 @@ class MeasurePanel(QWidget):
             walkoff=(dict(rate_y=self.spin_wo_y.value(), rate_x=self.spin_wo_x.value())
                      if self.chk_walkoff.isChecked() else None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            ft_region=self.combo_ftregion.currentText(),
-            ft_width=DEFAULT_FT_WIDTH_MM,
             center_method=self._center_method(),
+            complex_out=self.chk_complex.isChecked(),
         )
         # Keep the saved metadata in step with what was recomputed.
         self._scan_meta.update(
-            ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
+            ft_region="full",
             apodization=p["apod_type"], apod_width=p["apod"],
             wl_start_um=p["wl0"], wl_stop_um=p["wl1"], n_freq_setting=p["nfreq"],
             apod_center=p["center_method"],
+            complex_spectrum=p["complex_out"],
             recomputed=True)
         self.btn_run.setEnabled(False)
         self.btn_recompute.setEnabled(False)
-        self.lbl_status.setText(f"recomputing from raw (FT={p['ft_region']})...")
+        self.lbl_status.setText(
+            f"recomputing from raw (apod centre: {p['center_method']})...")
         threading.Thread(target=self._recompute_worker, args=(p,), daemon=True).start()
 
     def _recompute_worker(self, p: dict) -> None:
@@ -1153,6 +1161,7 @@ class MeasurePanel(QWidget):
             from instruments.analysis import saturation_mask
             proc = HyperspectralProcessor()
             cubes, masks, wls = [], [], None
+            complex_cubes = []
             for positions, datacube in zip(self.raw_positions, self.raw_cubes):
                 datacube = np.asarray(datacube)
                 sat_mask = None
@@ -1165,15 +1174,21 @@ class MeasurePanel(QWidget):
                 wl, cube = proc.compute_hyperspectral(
                     positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
                     apod_width=p["apod"], n_freq=n_freq,
-                    expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"], walkoff=p["walkoff"],
-                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
-                    center_method=p["center_method"])
+                    center_method=p["center_method"],
+                    complex_output=p["complex_out"])
                 if cube is None:
                     continue
+                # Keep the complex cube for saving; everything that DISPLAYS or
+                # averages the cube works on the magnitude, so the viewer, maps
+                # and ROI-average CSV are unaffected by the choice.
+                if p["complex_out"]:
+                    complex_cubes.append(np.asarray(cube, dtype=np.complex64))
+                    cube = np.abs(cube).astype(np.float32)
                 wls = wl
                 cubes.append(cube)
                 masks.append(sat_mask)
+            self.complex_cubes = complex_cubes
             self.sig_done.emit(wls, cubes, self.z_values, masks)
         except Exception as e:  # noqa: BLE001
             self.sig_status.emit(f"recompute error: {e}")
@@ -1214,6 +1229,7 @@ class MeasurePanel(QWidget):
             scanner = TwinsScanner(self.sp.twins, self.frame_source)
             proc = HyperspectralProcessor()
             cubes, zvals, masks, wls = [], [], [], None
+            complex_cubes = []
             raw_cubes, raw_positions = [], []
             # Background: subtract from each frame (if enabled) and record the
             # binned-ROI background in the cube geometry for saving.
@@ -1282,12 +1298,17 @@ class MeasurePanel(QWidget):
                 wl, cube = proc.compute_hyperspectral(
                     positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
                     apod_width=p["apod"], n_freq=n_freq,
-                    expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
                     apod_type=p["apod_type"], walkoff=p["walkoff"],
-                    ft_region=p["ft_region"], ft_width_mm=p["ft_width"],
-                    center_method=p["center_method"])
+                    center_method=p["center_method"],
+                    complex_output=p["complex_out"])
                 if cube is None:
                     continue
+                # Keep the complex cube for saving; everything that DISPLAYS or
+                # averages the cube works on the magnitude, so the viewer, maps
+                # and ROI-average CSV are unaffected by the choice.
+                if p["complex_out"]:
+                    complex_cubes.append(np.asarray(cube, dtype=np.complex64))
+                    cube = np.abs(cube).astype(np.float32)
                 wls = wl
                 cubes.append(cube)
                 # No Z / angle axis in this app -> the viewer's delay slider stays
@@ -1300,6 +1321,7 @@ class MeasurePanel(QWidget):
                 # _autosave_cube(), so there is no per-grid-point save here.
             self.raw_cubes = raw_cubes
             self.raw_positions = raw_positions
+            self.complex_cubes = complex_cubes
             self.sig_done.emit(wls, cubes, zvals, masks)
         except Exception as e:  # noqa: BLE001
             self.sig_status.emit(f"error: {e}")
@@ -1471,7 +1493,7 @@ class MeasurePanel(QWidget):
             raw_positions=getattr(self, "raw_positions", None) or [],
             raw_positions_calibrated=cal,
             wavelengths=self.wavelengths,
-            spectrum_cubes=np.asarray(self.cubes) if self.cubes else None,
+            spectrum_cubes=self._spectrum_for_saving() if self.cubes else None,
             sat_masks=getattr(self, "sat_masks", None),
             background=getattr(self, "background_map", None),
             background_subtracted=bool(getattr(self, "background_subtracted", False)),
@@ -1482,12 +1504,22 @@ class MeasurePanel(QWidget):
                     or self.edit_filename.text().strip()),
             save_dir=base)
 
+    def _spectrum_for_saving(self):
+        """The cube array to write: complex64 when "Save complex spectrum" was on
+        for this result, else the float32 magnitude in self.cubes."""
+        cx = getattr(self, "complex_cubes", None)
+        if cx and len(cx) == len(self.cubes):
+            # complex64 = float32 real + float32 imag: the phase costs one extra
+            # float32 per element, never float64. Pinned so nothing upcasts.
+            return np.asarray(cx, dtype=np.complex64)
+        return np.asarray(self.cubes, dtype=np.float32)
+
     def _save_cube_npz(self, stem: str) -> str:
         roi = getattr(self, "_scan_roi", None)
         meta = self._build_metadata()
         kw = dict(
             wavelengths=self.wavelengths,
-            spectrum_cubes=np.asarray(self.cubes),
+            spectrum_cubes=self._spectrum_for_saving(),
             z_values=np.asarray([np.nan if z is None else z for z in self.z_values]),
             z_unit="mm",
             roi=np.asarray(roi if roi is not None else [], dtype=float),
@@ -1561,6 +1593,7 @@ class MeasurePanel(QWidget):
             self.wavelengths, self.cubes, self.z_values = wl, cubes, z_values
             self.sat_masks = masks or [None] * len(cubes)
             self.raw_cubes, self.raw_positions = [], []  # not reloaded for viewing
+            self.complex_cubes = []
             self.lbl_status.setText(
                 f"loaded {os.path.basename(path)}: {len(cubes)} map(s), cube {cubes[0].shape}")
             self._open_viewer()

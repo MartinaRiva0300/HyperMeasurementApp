@@ -1,0 +1,24 @@
+# Forge SWIR + TWINS hyperspectral acquisition app (PyQt6). 64-bit Python 3.10 or 3.12
+# (those are the Python versions Teledyne ships PySpin wheels for).
+PyQt6
+pyqtgraph
+numpy
+scipy
+pandas
+Pillow
+tifffile
+loguru
+h5py            # only needed for the Measure tab's HDF5 save format
+#
+# Plus, for the real hardware (NOT needed for `--mode mock`):
+#
+#  - Teledyne Spinnaker Python bindings -- the Forge 1GigE SWIR camera.
+#    Not on PyPI; install the wheel that matches your Python version:
+#        pip install spinnaker_python-4.4.0.246-cp312-cp312-win_amd64.whl
+#    The wheel bundles the Spinnaker runtime DLLs, so `import PySpin` works on
+#    its own. Also install the matching **Spinnaker SDK installer** (drivers +
+#    VS redistributables) so the GigE filter driver and jumbo frames are set up.
+#
+#  - SmarAct MCS2 SDK -- the SLC-1750 TWINS wedge stage.
+#    Not on PyPI; install from the MCS2 SDK:
+#        pip install "C:\Program Files\SmarAct\MCS2\SDK\Python\packages\smaract_ctl-1.6.2.zip"

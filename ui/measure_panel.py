@@ -838,12 +838,12 @@ class MeasurePanel(QWidget):
         v.addLayout(row3)
         row3b = QHBoxLayout()
         self.combo_format = QComboBox()
-        self.combo_format.addItems([FORMAT_NPZ, FORMAT_H5])
+        self.combo_format.addItems([FORMAT_H5, FORMAT_NPZ])
         self.combo_format.setToolTip(
             "File format for the full cube:\n"
-            f"  {FORMAT_NPZ}  -> one .npz, the default; every tool here reads it\n"
-            f"  {FORMAT_H5}  -> ScopeFoundry layout, t0/c0/image + t0/c0/position_mm,\n"
-            "                named <timestamp>_hyperspectral_<filename>.h5\n"
+            f"  {FORMAT_H5}  -> the default; ScopeFoundry layout, t0/c0/image +\n"
+            "                t0/c0/position_mm, named <timestamp>_hyperspectral_<filename>.h5\n"
+            f"  {FORMAT_NPZ}  -> one .npz; every tool here reads it\n"
             "The ROI-average CSV is unaffected.")
         row3b.addWidget(QLabel("Format")); row3b.addWidget(self.combo_format, 1)
         v.addLayout(row3b)

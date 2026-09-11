@@ -16,7 +16,6 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -105,7 +104,6 @@ class MainWindow(QMainWindow):
             self._build_camera_group(),
             self._build_processing_group(),
             self._build_save_group(),
-            self._build_measurements_group(),
         ]), "Camera")
         self.twins_scan_panel = TwinsScanPanel(
             self.stages_panel.twins_ctl,
@@ -539,25 +537,6 @@ class MainWindow(QMainWindow):
         else:
             self.save_status_label.setText("Save FAILED (see console)")
 
-    def _build_measurements_group(self) -> QGroupBox:
-        group = QGroupBox("Measurements")
-        layout = QFormLayout(group)
-
-        self.measurement_labels = {}
-        for key in (
-            "peak",
-            "total_power",
-            "centroid_x",
-            "centroid_y",
-            "beam_width_x",
-            "beam_width_y",
-        ):
-            label = QLabel("-")
-            layout.addRow(key.replace("_", " ").title(), label)
-            self.measurement_labels[key] = label
-
-        return group
-
     def _ms_to_slider(self, ms: float) -> int:
         ms = float(np.clip(ms, self.INT_MIN_MS, self.INT_MAX_MS))
         frac = np.log10(ms / self.INT_MIN_MS) / np.log10(self.INT_MAX_MS / self.INT_MIN_MS)
@@ -773,36 +752,6 @@ class MainWindow(QMainWindow):
         self.image_item.setColorMap(self.color_map)
         self.color_bar.setColorMap(self.color_map)
 
-    def _compute_measurements(self, frame: np.ndarray) -> dict[str, float]:
-        weights = np.clip(frame.astype(np.float64), 0.0, None)
-        total_power = float(weights.sum())
-        peak = float(np.nanmax(frame)) if frame.size else 0.0
-
-        if total_power <= 0:
-            return {
-                "peak": peak,
-                "total_power": 0.0,
-                "centroid_x": 0.0,
-                "centroid_y": 0.0,
-                "beam_width_x": 0.0,
-                "beam_width_y": 0.0,
-            }
-
-        yy, xx = np.indices(frame.shape, dtype=np.float64)
-        centroid_x = float((weights * xx).sum() / total_power)
-        centroid_y = float((weights * yy).sum() / total_power)
-        var_x = float((weights * (xx - centroid_x) ** 2).sum() / total_power)
-        var_y = float((weights * (yy - centroid_y) ** 2).sum() / total_power)
-
-        return {
-            "peak": peak,
-            "total_power": total_power,
-            "centroid_x": centroid_x,
-            "centroid_y": centroid_y,
-            "beam_width_x": 2.0 * np.sqrt(max(var_x, 0.0)),
-            "beam_width_y": 2.0 * np.sqrt(max(var_y, 0.0)),
-        }
-
     def _render_export_panel(self, painter: QPainter) -> None:
         self.export_panel.render(painter)
 
@@ -986,16 +935,6 @@ class MainWindow(QMainWindow):
                 pass
             self._update_crosshair()
             self._update_profiles(display_frame)
-
-            processed_measurement = self._compute_measurements(display_frame)
-            for key, label in self.measurement_labels.items():
-                value = processed_measurement.get(key, 0.0)
-                if key in {"centroid_x", "centroid_y", "beam_width_x", "beam_width_y"}:
-                    label.setText(f"{value:.2f} px")
-                elif key == "total_power":
-                    label.setText(f"{value:.0f}")
-                else:
-                    label.setText(f"{value:.1f}")
 
         self.frame_count += 1
         now = time.time()

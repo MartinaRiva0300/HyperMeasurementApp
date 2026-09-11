@@ -9,20 +9,23 @@ Pillow
 tifffile
 loguru
 h5py            # only needed for the Measure tab's HDF5 save format
-#
-# Plus, for the real hardware (NOT needed for `--mode mock`):
-#
-#  - Teledyne Spinnaker Python bindings -- the Forge 1GigE SWIR camera.
-#    Not on PyPI; install the wheel that matches your Python version:
-#        pip install spinnaker_python-4.4.0.246-cp312-cp312-win_amd64.whl
-#    The wheel bundles the Spinnaker runtime DLLs, so `import PySpin` works on
-#    its own. Also install the matching **Spinnaker SDK installer** (drivers +
-#    VS redistributables) so the GigE filter driver and jumbo frames are set up.
-#
-#  - SmarAct MCS2 SDK -- the SLC-1750 TWINS wedge stage.
-#    Not on PyPI. A prebuilt, cross-platform wheel is vendored in this repo so it
-#    installs the same way on every machine (no build step, any Python 3):
-#        pip install wheels/smaract_ctl-1.5.3-py3-none-any.whl
-#    (See wheels/README.md for why we ship a wheel instead of the SDK .zip.)
-#    NOTE: the wheel is the Python API only -- the SmarActCTL.dll still comes from
-#    running the SmarAct MCS2 software installer on the machine driving the stage.
+
+# -- SmarAct MCS2 stage (the SLC-1750 TWINS wedge) ----------------------------
+# Not on PyPI. A pure-Python (py3-none-any) wheel is vendored in this repo, so
+# `pip install -r requirements.txt` installs it on any OS / Python 3, no build
+# step. See wheels/README.md for why we ship a wheel instead of the SDK .zip.
+# NOTE: this is the Python API only -- SmarActCTL.dll still comes from running
+# the SmarAct MCS2 software installer on the machine that drives the stage.
+# (Harmless to install even for --mode mock; it just isn't used without hardware.)
+wheels/smaract_ctl-1.5.3-py3-none-any.whl
+
+# -- Teledyne Spinnaker / PySpin (the Forge 1GigE SWIR camera) ----------------
+# NOT listed as a requirement above because, unlike SmarAct, PySpin is a
+# COMPILED binary wheel tied to a specific OS + Python version (e.g.
+# cp312-cp312-win_amd64) -- it is not cross-platform, so it can't be a portable
+# requirement line. Install the wheel matching your interpreter, e.g.:
+#     pip install spinnaker_python-4.4.0.246-cp312-cp312-win_amd64.whl
+# The wheel bundles the Spinnaker runtime DLLs, so `import PySpin` works on its
+# own. Also run the matching Spinnaker SDK installer (drivers + VS
+# redistributables) for the GigE filter driver and jumbo frames.
+# Not needed for `--mode mock`.

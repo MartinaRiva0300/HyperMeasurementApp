@@ -192,33 +192,6 @@ def _get_cmap(name):
         return None
 
 
-def _bwr_cmap():
-    """Diverging blue-white-red map (blue = -π, white = 0, red = +π)."""
-    return pg.ColorMap(pos=[0.0, 0.5, 1.0],
-                       color=[(0, 0, 255), (255, 255, 255), (255, 0, 0)])
-
-
-# Selectable colormaps for the wrapped-phase image. 'blue-white-red' is the
-# default (signed, diverging); 'cyclic (CET-C1)' is topologically correct for
-# wrapped phase; the rest fall through to the shared resolver / pyqtgraph.
-PHASE_CMAPS = ["blue-white-red", "cyclic (CET-C1)", "turbo", "jet", "grey"]
-
-
-def _phase_cmap(name):
-    key = str(name).lower()
-    if key in ("blue-white-red", "bwr"):
-        return _bwr_cmap()
-    if key.startswith("cyclic"):
-        try:
-            cm = pg.colormap.get("CET-C1")
-            if cm is not None:
-                return cm
-        except Exception:  # noqa: BLE001
-            pass
-    cm = _get_cmap(name)
-    return cm if cm is not None else _bwr_cmap()
-
-
 _ROI_COLORS = ["#e8590c", "#1c7ed6", "#2f9e44", "#ae3ec9", "#f08c00", "#e64980"]
 
 # LRU cube/raw caches: keep at most this many recent cubes, and never exceed this
@@ -352,9 +325,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self.sel_pixels = []           # list of (row, col) clicked pixels
         self.recompute_on = False      # compute map from raw interferogram window
         self.proc = None               # HyperspectralProcessor (lazy)
-        self.phase_mode = False        # True while the phase-only page is shown
-        self.phase_bkg = None          # (ref_raw_cube, ref_positions, path) background
-        self.phase_bkg_on = False      # subtract the background phase (per-pixel)
         self._stokes_dirty = True      # Stokes panel needs (re)fill from loaded folder
         self.work_roi = None           # pg.RectROI defining the analysis crop (or None)
         self._full_hw = None           # (h, w) of the FULL current frame (pre-crop)
@@ -371,7 +341,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
     # -- UI -------------------------------------------------------------------
     def _build_ui(self):
         # toolbar: exactly six controls -- Load folder | Load files | [view
-        # selector: Hypercube · Phase · Stokes] | Save/Export dropdown.
+        # selector: Hypercube · Stokes] | Save/Export dropdown.
         tb = self.addToolBar("File")
         tb.setMovable(False)
         tb.addAction("Load folder…").triggered.connect(self.load_folder)
@@ -380,7 +350,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
         # View selector: three mutually-exclusive toggles picking the central page.
         # Exactly one is always active, so "Hypercube" is the always-available way
-        # back from the Phase / Stokes views.
+        # back from the Stokes view.
         self.view_group = QtGui.QActionGroup(self)
         self.view_group.setExclusive(True)
         self.act_hyper = tb.addAction("Hypercube")
@@ -390,12 +360,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
                                   "process and metadata.")
         self.act_hyper.toggled.connect(self._toggle_hyper_view)
         self.view_group.addAction(self.act_hyper)
-        self.act_phase = tb.addAction("Phase")
-        self.act_phase.setCheckable(True)
-        self.act_phase.setToolTip("Show only the amplitude + wrapped-phase maps "
-                                  "(recomputed complex DFT at the current λ).")
-        self.act_phase.toggled.connect(self._toggle_phase_view)
-        self.view_group.addAction(self.act_phase)
         self.act_stokes = None
         if StokesApp is not None:
             self.act_stokes = tb.addAction("Stokes")
@@ -485,7 +449,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         ctl.addWidget(QtWidgets.QLabel("γ:")); ctl.addWidget(self.spin_gamma)
         left.addLayout(ctl)
 
-        # Analysis ROI: crop EVERY panel (map, spectra, clicked pixels, phase,
+        # Analysis ROI: crop EVERY panel (map, spectra, clicked pixels,
         # raw-recompute) to a rectangle so nothing outside it is ever computed.
         # Uncheck to see the full frame + drag the box; check to crop to it.
         wrow = QtWidgets.QHBoxLayout()
@@ -739,116 +703,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         ig.addWidget(self.lbl_win)
         tabs.addTab(igw, "Interferogram / Recompute")
 
-        # Phase tab: recompute the COMPLEX per-pixel DFT at the current λ / plane
-        # and show XY amplitude + wrapped phase side by side. The saved cube keeps
-        # only the DFT magnitude (np.abs), so the interferometric phase is lost;
-        # this re-runs the identical forward transform (same FT window as the
-        # Interferogram/Recompute tab + its apodization) and keeps the phase.
-        self.phase_page = QtWidgets.QWidget(); ph = QtWidgets.QVBoxLayout(self.phase_page)
-        self._last_phase = None
-        # Slim slider bar so the phase-only page is self-contained: λ (+ z / angle
-        # when present) mirror the main sliders both ways (see _mirror_phase_sliders).
-        pbar = QtWidgets.QHBoxLayout()
-        self.ph_wl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.ph_lbl_wl = QtWidgets.QLabel("-- µm"); self.ph_lbl_wl.setStyleSheet("font-weight:600;")
-        pbar.addWidget(QtWidgets.QLabel("λ:")); pbar.addWidget(self.ph_wl, 1); pbar.addWidget(self.ph_lbl_wl)
-        # Z as a dropdown of the actual positions (like the Stokes panel), rather
-        # than a slider -- lists each z in mm and jumps straight to it.
-        self.ph_z_combo = QtWidgets.QComboBox(); self.ph_z_combo.setMinimumWidth(110)
-        self.ph_zrow = QtWidgets.QWidget(); _pz = QtWidgets.QHBoxLayout(self.ph_zrow); _pz.setContentsMargins(0,0,0,0)
-        _pz.addWidget(QtWidgets.QLabel("Z:")); _pz.addWidget(self.ph_z_combo, 1)
-        self.ph_a = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.ph_lbl_a = QtWidgets.QLabel("--")
-        self.ph_arow = QtWidgets.QWidget(); _pa = QtWidgets.QHBoxLayout(self.ph_arow); _pa.setContentsMargins(0,0,0,0)
-        _pa.addWidget(QtWidgets.QLabel("Angle:")); _pa.addWidget(self.ph_a, 1); _pa.addWidget(self.ph_lbl_a)
-        self.ph_zrow.setVisible(False); self.ph_arow.setVisible(False)
-        pbar.addWidget(self.ph_zrow, 1); pbar.addWidget(self.ph_arow, 1)
-        ph.addLayout(pbar)
-        # Two-way mirror: moving a phase slider drives the master (which updates the
-        # maps); moving the master mirrors back. setValue only re-emits on a real
-        # change, so the two converge with no feedback loop.
-        self.ph_wl.valueChanged.connect(self.wl_slider.setValue)
-        self.ph_a.valueChanged.connect(self.angle_slider.setValue)
-        self.wl_slider.valueChanged.connect(self.ph_wl.setValue)
-        self.angle_slider.valueChanged.connect(self.ph_a.setValue)
-        # Z dropdown <-> master z slider (index == z position). setCurrentIndex /
-        # setValue only re-emit on a real change, so the two converge, no loop.
-        self.ph_z_combo.currentIndexChanged.connect(self._on_ph_z_combo)
-        self.z_slider.valueChanged.connect(self.ph_z_combo.setCurrentIndex)
-        self.ph_glw = pg.GraphicsLayoutWidget()
-        self.ph_glw.addLabel("Amplitude", row=0, col=0, colspan=2)
-        self.ph_glw.addLabel("Wrapped phase [-π, π]", row=0, col=2, colspan=2)
-        vb_a = self.ph_glw.addViewBox(row=1, col=0)
-        vb_a.setAspectLocked(True); vb_a.invertY(True)
-        self.ph_img_amp = pg.ImageItem(); vb_a.addItem(self.ph_img_amp)
-        self.ph_cbar_amp = pg.ColorBarItem(interactive=False, colorMap=_get_cmap("turbo"))
-        self.ph_glw.addItem(self.ph_cbar_amp, row=1, col=1)
-        self.ph_cbar_amp.setImageItem(self.ph_img_amp)
-        vb_p = self.ph_glw.addViewBox(row=1, col=2)
-        vb_p.setAspectLocked(True); vb_p.invertY(True)
-        vb_p.setBackgroundColor(pg.mkColor(200, 200, 200))
-        self.ph_img_phase = pg.ImageItem(); vb_p.addItem(self.ph_img_phase)
-        self.ph_cbar_phase = pg.ColorBarItem(interactive=False,
-                                             colorMap=_phase_cmap(PHASE_CMAPS[0]),
-                                             values=(-np.pi, np.pi))
-        self.ph_glw.addItem(self.ph_cbar_phase, row=1, col=3)
-        self.ph_cbar_phase.setImageItem(self.ph_img_phase)
-        ph.addWidget(self.ph_glw, 1)
-        pc = QtWidgets.QHBoxLayout()
-        pc.addWidget(QtWidgets.QLabel("Phase colors"))
-        self.ph_cmap_combo = QtWidgets.QComboBox()
-        self.ph_cmap_combo.addItems(PHASE_CMAPS)
-        self.ph_cmap_combo.currentTextChanged.connect(self._on_phase_cmap)
-        pc.addWidget(self.ph_cmap_combo)
-        pc.addWidget(QtWidgets.QLabel("Phase mask below"))
-        self.ph_thresh = QtWidgets.QDoubleSpinBox()
-        self.ph_thresh.setRange(0.0, 100.0); self.ph_thresh.setValue(5.0)
-        self.ph_thresh.setSuffix(" % max amp"); self.ph_thresh.setDecimals(2)
-        self.ph_thresh.valueChanged.connect(self._update_phase)
-        pc.addWidget(self.ph_thresh)
-        # Soft amplitude mask: multiply the wrapped phase by the normalised
-        # amplitude (left image) so low-amplitude pixels fade toward 0 -- a
-        # per-wavelength weighting, applied ON TOP of the threshold mask.
-        self.chk_ph_ampmask = QtWidgets.QCheckBox("× amplitude")
-        self.chk_ph_ampmask.setToolTip("Weight the phase by the normalised amplitude "
-                                       "(left image): low-amplitude pixels fade to zero.")
-        self.chk_ph_ampmask.toggled.connect(self._update_phase)
-        pc.addWidget(self.chk_ph_ampmask)
-        btn_ph_exp = QtWidgets.QPushButton("Export amp+phase…")
-        btn_ph_exp.clicked.connect(self._export_phase)
-        pc.addWidget(btn_ph_exp); pc.addStretch(1)
-        ph.addLayout(pc)
-
-        # Background phase correction: load a background interferogram and subtract
-        # its per-pixel phase (removes the interferometer's instrumental phase,
-        # leaving the true spectral phase). Can phase + save the whole Z×θ stack.
-        pb = QtWidgets.QHBoxLayout()
-        btn_bkg = QtWidgets.QPushButton("Load background…")
-        btn_bkg.setToolTip("Load a background interferogram (.npz with raw_interferogram) "
-                           "of the SAME ROI + wedge scan. Its per-pixel phase is subtracted.")
-        btn_bkg.clicked.connect(self._phase_load_bkg)
-        self.chk_phase_bkg = QtWidgets.QCheckBox("Subtract background phase")
-        self.chk_phase_bkg.setEnabled(False)
-        self.chk_phase_bkg.toggled.connect(self._on_phase_bkg_toggled)
-        btn_phase_stack = QtWidgets.QPushButton("Phase Z×θ stack → save…")
-        btn_phase_stack.setToolTip("Phase-correct every cube in the loaded stack with the "
-                                   "background and save the phased spectrum cubes to a folder.")
-        btn_phase_stack.clicked.connect(self._phase_stack_save)
-        pb.addWidget(btn_bkg); pb.addWidget(self.chk_phase_bkg)
-        pb.addWidget(btn_phase_stack); pb.addStretch(1)
-        ph.addLayout(pb)
-        self.lbl_phase_bkg = QtWidgets.QLabel("Background: none loaded.")
-        self.lbl_phase_bkg.setStyleSheet("color:#888;"); self.lbl_phase_bkg.setWordWrap(True)
-        ph.addWidget(self.lbl_phase_bkg)
-
-        self.ph_info = QtWidgets.QLabel(
-            "Move the λ slider to change wavelength. The FT window + apodization "
-            "are taken from the Interferogram / Recompute tab.")
-        self.ph_info.setWordWrap(True); self.ph_info.setStyleSheet("color:#666;")
-        ph.addWidget(self.ph_info)
-        # (phase_page is NOT a tab -- it is page 1 of the central stack, shown via
-        # the "Phase" toolbar toggle.)
-
         # Metadata tab
         self.meta = QtWidgets.QPlainTextEdit(); self.meta.setReadOnly(True)
         self.meta.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
@@ -856,17 +710,15 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
         tabs.currentChanged.connect(self._on_tab_changed)
 
-        # Central stack: page 0 = normal analysis view, page 1 = phase-only page
-        # (just the amplitude + wrapped-phase maps). The "Phase" toolbar toggle
-        # switches between them.
+        # Central stack: page 0 = normal analysis view. The Stokes toolbar toggle
+        # switches to the embedded Stokes page when present.
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self.main_split)   # index 0
-        self.stack.addWidget(self.phase_page)   # index 1
         # Stokes page: embed the standalone StokesApp (its own self-contained UI
         # + file loading), so the panel behaves exactly like stokes_app.py.
         self.stokes_app = StokesApp(embedded=True) if StokesApp is not None else None
         if self.stokes_app is not None:
-            self.stack.addWidget(self.stokes_app)   # index 2
+            self.stack.addWidget(self.stokes_app)   # index 1
         self.setCentralWidget(self.stack)
 
         self.statusBar().showMessage("No data — File ▸ Load folder…")
@@ -956,8 +808,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.update_spectra()
             self.update_interferogram()
             self._update_meta()
-            self._mirror_phase_sliders()   # phase-page sliders track the new data
-            self._update_phase()
             zr = (f"{self._z_axis[0]:.3f}…{self._z_axis[-1]:.3f} mm"
                   if len(self._z_axis) > 1 else
                   ("single Z" if self._z_axis[0] != self._z_axis[0]
@@ -1090,7 +940,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._kmeans_labels = None; self._cluster_key = None
         self._update_work_label()
         self.refresh_map(); self.update_spectra()
-        self.update_interferogram(); self._update_meta(); self._update_phase()
+        self.update_interferogram(); self._update_meta()
 
     def _reset_work_crop(self):
         """New dataset -> discard the analysis ROI (its dims may differ) and return
@@ -1132,7 +982,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self.statusBar().showMessage("No cube acquired at this Z / angle combination.")
         self.refresh_map(); self.update_spectra()
         self.update_interferogram(); self._update_meta()
-        self._update_phase()
 
     # -- cube access (lazy, with denoise) ------------------------------------
     def _base_cube(self, zi):
@@ -1273,7 +1122,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._trim_cache(self._raw_cache)
         pos, raw, _ = self._raw_cache[zi]
         # The cache holds the FULL raw; track full dims and return the analysis-ROI
-        # crop so phase / recompute only work on the region of interest.
+        # crop so recompute only works on the region of interest.
         if raw is not None:
             self._full_hw = raw.shape[1:]
         return pos, self._work_crop3(raw)
@@ -1283,16 +1132,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         (so recompute must NOT re-correct it)."""
         entry = self._raw_cache.get(self._cur())
         return bool(entry[2]) if entry else False
-
-    def _phase_ref_cube(self, shape):
-        """The background reference interferogram to phase-correct against, if one
-        is loaded, phasing is enabled, and its shape matches (else None)."""
-        if not self.phase_bkg_on or self.phase_bkg is None:
-            return None
-        # Crop the (full-frame) background to the SAME analysis ROI so it matches
-        # the cropped measurement raw before its phase is subtracted.
-        ref_raw = self._work_crop3(self.phase_bkg[0])
-        return ref_raw if getattr(ref_raw, "shape", None) == tuple(shape) else None
 
     def _compute_from_raw(self, zi):
         pos, raw = self.current_interferogram()
@@ -1307,7 +1146,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             ft_window_mm=self.win_region.getRegion(),
             expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
             positions_calibrated=self.current_positions_calibrated(),
-            reference_cube=self._phase_ref_cube(raw.shape),
             center_method=self._center_method())
 
     def _center_method(self):
@@ -1363,7 +1201,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         self._apply_wl_slider_range()
         self.refresh_map()
         self.update_spectra()
-        self._update_phase()
 
     def update_interferogram(self):
         if not self.infos:
@@ -1440,7 +1277,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         elif self.chk_recompute.isEnabled():
             self.statusBar().showMessage(
                 "Tick 'Recompute…' to apply this interferogram window.", 5000)
-        self._update_phase()   # phase always tracks the FT window
 
     def _toggle_recompute(self, on):
         self.recompute_on = bool(on)
@@ -1449,10 +1285,8 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._sync_wl_slider(len(self.wavelengths))
         self._cube_cache.clear()
         self.refresh_map(); self.update_spectra()
-        self._update_phase()
 
     def _recompute_if_on(self, *a):
-        self._update_phase()   # apodization also drives the phase view
         if self.recompute_on:
             self._cube_cache.clear()
             self.refresh_map(); self.update_spectra()
@@ -1606,7 +1440,6 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         cm = _get_cmap(self.combo_cmap.currentText())
         if cm is not None:
             self.iv.setColorMap(cm)
-        self._update_phase()
 
     def _show_rgb(self):
         """Render the false-colour RGB map in the left viewer (over the current
@@ -1631,7 +1464,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
             self._set_map_image(self._gamma(cube[i], gamma))
         elif mode == "Interferogram slice":
             # Scrub the raw temporal hypercube: one XY frame at the selected motor
-            # position. Uses the SAME ROI-cropped raw as the phase/recompute paths.
+            # position. Uses the SAME ROI-cropped raw as the recompute path.
             pos, raw = self.current_interferogram()
             if raw is None or pos is None:
                 self.iv.clear()
@@ -1862,7 +1695,7 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
 
     # -- sliders / click ------------------------------------------------------
     def _on_wl(self, *a):
-        # Update the λ label instantly; debounce the map/phase recompute so a
+        # Update the λ label instantly; debounce the map recompute so a
         # slider drag stays smooth (short delay -- a λ-slice is a cheap band pick).
         if self.wavelengths is not None and len(self.wavelengths):
             i = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
@@ -1872,29 +1705,19 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
     def _do_wl_refresh(self):
         if self.combo_map.currentText() in ("λ slice", "Interferogram slice"):
             self.refresh_map()
-        self._update_phase()
 
-    # -- phase view (complex DFT at one wavelength) ---------------------------
+    # -- view toggles ---------------------------------------------------------
     def _on_tab_changed(self, *a):
-        # Phase is no longer a tab (it is the toolbar-toggled stack page); nothing
-        # to do here, kept so the currentChanged connection stays valid.
+        # Kept so the tabs' currentChanged connection stays valid; nothing to do.
         pass
 
-    # The three view toggles share an exclusive QActionGroup, so exactly one is
-    # active; switching one off fires when another is switched on. Each handler
-    # just re-derives the page from the current checked states via _show_view.
+    # The view toggles share an exclusive QActionGroup, so exactly one is active;
+    # switching one off fires when another is switched on. Each handler just
+    # re-derives the page from the current checked states via _show_view.
     def _toggle_hyper_view(self, on):
         """Back to the main hypercube view."""
         if on:
             self._show_view()
-
-    def _toggle_phase_view(self, on):
-        """Show the phase-only page (amplitude + wrapped phase)."""
-        self.phase_mode = bool(on)
-        self._show_view()
-        if on:
-            self._mirror_phase_sliders()
-            self._update_phase()
 
     def _toggle_stokes_view(self, on):
         """Show the embedded Stokes polarimetry page. On entry, (re)fill it from
@@ -1921,250 +1744,10 @@ class ZSeriesAnalyzer(QtWidgets.QMainWindow):
         """Pick the central page from the view toggles (Hypercube = main view)."""
         if getattr(self, "stack", None) is None:
             return                                  # toolbar built before the stack
-        if self.act_phase.isChecked():
-            self.stack.setCurrentWidget(self.phase_page)
-        elif self.act_stokes is not None and self.act_stokes.isChecked():
+        if self.act_stokes is not None and self.act_stokes.isChecked():
             self.stack.setCurrentWidget(self.stokes_app)
         else:
             self.stack.setCurrentWidget(self.main_split)
-
-    def _on_ph_z_combo(self, idx):
-        """Phase-page Z dropdown -> select that Z (drives the whole refresh)."""
-        if idx >= 0:
-            self.z_slider.setValue(idx)
-
-    def _mirror_phase_sliders(self):
-        """Copy the master λ/angle sliders' ranges/values/visibility onto the
-        phase-page controls, and fill the Z dropdown from the loaded positions
-        (signals blocked so it never fights the two-way connections)."""
-        for src, dst in ((self.wl_slider, self.ph_wl), (self.angle_slider, self.ph_a)):
-            dst.blockSignals(True)
-            dst.setMinimum(src.minimum()); dst.setMaximum(src.maximum())
-            dst.setValue(src.value())
-            dst.blockSignals(False)
-        # Z dropdown: one entry per position (in mm), current = the master z index.
-        self.ph_z_combo.blockSignals(True)
-        self.ph_z_combo.clear()
-        for z in self._z_axis:
-            self.ph_z_combo.addItem("--" if z != z else f"{z:.4f} mm")
-        self.ph_z_combo.setCurrentIndex(min(max(self.z_slider.value(), 0),
-                                            len(self._z_axis) - 1))
-        self.ph_z_combo.blockSignals(False)
-        # Base visibility on the data (the main panel is hidden while the phase
-        # page is shown, so its rows' isVisible() would read False here).
-        self.ph_zrow.setVisible(len(self._z_axis) > 1)
-        self.ph_arow.setVisible(len(self._a_axis) > 1)
-        self.ph_lbl_wl.setText(self.lbl_wl.text())
-        self.ph_lbl_a.setText(self.lbl_a.text())
-
-    def _on_phase_cmap(self, *a):
-        """Recolor the wrapped-phase map (colormap only -- no DFT recompute)."""
-        cm = _phase_cmap(self.ph_cmap_combo.currentText())
-        self.ph_cbar_phase.setColorMap(cm)
-        self.ph_img_phase.setColorMap(cm)
-
-    def _update_phase(self, *a):
-        """Recompute the complex per-pixel DFT at the current λ / plane and draw
-        the XY amplitude + wrapped-phase maps. Lazy: only runs while the phase-only
-        page is shown (a full DFT per λ move is otherwise wasted)."""
-        if not getattr(self, "phase_mode", False):
-            return
-        # Keep the phase-page controls in step with the master view.
-        self.ph_lbl_a.setText(self.lbl_a.text())
-        if (self.ph_z_combo.count() and self.ph_z_combo.currentIndex() != self.z_slider.value()):
-            self.ph_z_combo.blockSignals(True)
-            self.ph_z_combo.setCurrentIndex(min(max(self.z_slider.value(), 0),
-                                                self.ph_z_combo.count() - 1))
-            self.ph_z_combo.blockSignals(False)
-        if self.wavelengths is not None and len(self.wavelengths):
-            _i = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
-            self.ph_lbl_wl.setText(f"{float(np.asarray(self.wavelengths)[_i]):.3f} µm")
-        if not self.infos or self.wavelengths is None:
-            return
-        pos, raw = self.current_interferogram()
-        if raw is None or pos is None:
-            self.ph_img_amp.clear(); self.ph_img_phase.clear()
-            self._last_phase = None
-            self.ph_info.setText("This file has no stored raw interferogram — "
-                                 "the phase view is unavailable (re-acquire with raw saved).")
-            return
-        idx = int(np.clip(self.wl_slider.value(), 0, len(self.wavelengths) - 1))
-        lam = float(np.asarray(self.wavelengths)[idx])
-        if self.proc is None:
-            self.proc = HyperspectralProcessor()
-        try:
-            cmap, info = self.proc.compute_complex_map(
-                pos, raw, lam, apod_type=self.r_apod.currentText(),
-                ft_window_mm=self.win_region.getRegion(),
-                expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
-                positions_calibrated=self.current_positions_calibrated(),
-                reference_cube=self._phase_ref_cube(raw.shape),
-                center_method=self._center_method())
-        except Exception as e:  # noqa: BLE001
-            self.ph_info.setText(f"Phase compute failed: {e}")
-            return
-        if cmap is None:
-            self.ph_info.setText("Too few scan positions for a DFT.")
-            return
-        amp = np.abs(cmap).astype(np.float32)
-        phase = np.angle(cmap).astype(np.float32)
-        amax = float(amp.max()) if amp.size else 0.0
-        hi = amax if amax > 0 else 1.0
-        thr = self.ph_thresh.value() / 100.0
-        ph_masked = phase.copy()
-        if amax > 0:
-            ph_masked[amp < thr * amax] = np.nan     # NaN -> transparent (grey bg)
-        # Optional soft mask: weight the phase by the normalised amplitude so
-        # low-amplitude pixels fade toward zero (NaN threshold-masked pixels stay
-        # NaN, since NaN * x = NaN). Applied per wavelength (this map's amplitude).
-        if self.chk_ph_ampmask.isChecked() and amax > 0:
-            ph_masked = ph_masked * (amp / amax)
-        cm_amp = _get_cmap(self.combo_cmap.currentText())
-        self.ph_img_amp.setImage(amp, autoLevels=False)
-        self.ph_cbar_amp.setColorMap(cm_amp)
-        self.ph_cbar_amp.setLevels((0.0, hi))
-        self.ph_img_phase.setImage(ph_masked, autoLevels=False, levels=(-np.pi, np.pi))
-        self._last_phase = (amp, phase)
-        axis_txt = ("calibrated axis (as-is)" if self.current_positions_calibrated()
-                    else "raw axis + motor cal")
-        corr = ("BACKGROUND-CORRECTED phase" if info.get("phase_corrected")
-                else "raw phase (interferometer phase included)")
-        lo_w, hi_w = self.win_region.getRegion()
-        self.ph_info.setText(
-            f"λ = {lam:.4f} µm   |   {corr}   |   ZPD {info['center_mm']:.4f} mm   |   "
-            f"FT window {lo_w:.3f}–{hi_w:.3f} mm   |   apod {self.r_apod.currentText()}   |   "
-            f"{axis_txt}   |   phase masked below {self.ph_thresh.value():.3g}% of max amplitude"
-            + ("   |   × amplitude weighting" if self.chk_ph_ampmask.isChecked() else ""))
-
-    def _export_phase(self):
-        lp = getattr(self, "_last_phase", None)
-        if lp is None:
-            self.statusBar().showMessage("No phase map yet — open the Phase tab first.", 4000)
-            return
-        amp, phase = lp
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export amplitude + phase", "phase_map.tsv",
-            "Tab-separated (*.tsv *.txt)")
-        if not path:
-            return
-        h, w = amp.shape
-        rows, cols = np.mgrid[0:h, 0:w]
-        data = np.column_stack([cols.ravel(), rows.ravel(),
-                                amp.ravel(), phase.ravel()])
-        np.savetxt(path, data, fmt="%.6g", delimiter="\t",
-                   header="col\trow\tamplitude\tphase_rad", comments="")
-        self.statusBar().showMessage(f"Saved {data.shape[0]} rows to {path}", 5000)
-
-    # -- background phase correction ------------------------------------------
-    def _phase_load_bkg(self):
-        """Load a background interferogram (.npz with raw_interferogram) to phase
-        the measurement against (per-pixel instrumental-phase removal)."""
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load background interferogram", "", "NumPy archive (*.npz)")
-        if not path:
-            return
-        try:
-            with np.load(path, allow_pickle=True) as d:
-                raw, pos, _cal = _read_raw(d, None)
-        except Exception as e:  # noqa: BLE001
-            self.statusBar().showMessage(f"could not read background: {e}", 6000)
-            return
-        if raw is None or pos is None:
-            self.lbl_phase_bkg.setText("Background: that file has no raw interferogram.")
-            return
-        self.phase_bkg = (np.asarray(raw, dtype=np.float32), np.asarray(pos, float), path)
-        self.chk_phase_bkg.setEnabled(True)
-        self._describe_phase_bkg()
-        if self.chk_phase_bkg.isChecked():
-            self._on_phase_bkg_toggled(True)          # already on -> just refresh
-        else:
-            self.chk_phase_bkg.setChecked(True)       # -> toggles on + refreshes
-
-    def _describe_phase_bkg(self):
-        if self.phase_bkg is None:
-            self.lbl_phase_bkg.setText("Background: none loaded."); return
-        raw, _pos, path = self.phase_bkg
-        compat = ""
-        if self.infos:
-            cur = self.current_interferogram()[1]          # cropped to the analysis ROI
-            if cur is not None:
-                refc = self._work_crop3(raw)               # crop the ref the same way
-                compat = ("  —  compatible ✓" if refc.shape == cur.shape
-                          else f"  —  SHAPE MISMATCH ✗ (data is {tuple(cur.shape)})")
-        state = "ON" if self.phase_bkg_on else "off"
-        self.lbl_phase_bkg.setText(
-            f"Background: {os.path.basename(path)}  {tuple(raw.shape)}{compat}   [correction {state}]")
-
-    def _on_phase_bkg_toggled(self, on):
-        self.phase_bkg_on = bool(on) and self.phase_bkg is not None
-        self._describe_phase_bkg()
-        if self.recompute_on:          # main view re-derives phased spectra
-            self._invalidate_and_refresh()
-        self._update_phase()           # phase page shows the corrected phase
-
-    def _phase_stack_save(self):
-        """Phase-correct EVERY cube in the loaded (Z × θ) stack with the loaded
-        background and save the phased spectrum cubes to a new folder."""
-        if self.phase_bkg is None:
-            self.statusBar().showMessage("Load a background first.", 4000)
-            return
-        if not self.infos:
-            return
-        dest = QtWidgets.QFileDialog.getExistingDirectory(self, "Save phased Z×θ stack to…")
-        if not dest:
-            return
-        ref_raw = self.phase_bkg[0]
-        if self.proc is None:
-            self.proc = HyperspectralProcessor()
-        wl0, wl1 = self.r_wl0.value(), self.r_wl1.value()
-        apod = self.r_apod.currentText(); win = list(self.win_region.getRegion())
-        cmethod = self._center_method()
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
-        saved = skipped = 0
-        try:
-            for k, info in enumerate(self.infos):
-                self.statusBar().showMessage(f"phasing {k+1}/{len(self.infos)}…")
-                QtWidgets.QApplication.processEvents()
-                mi = info.get("map_index")
-                with np.load(info["path"], allow_pickle=True) as d:
-                    raw, pos, calibrated = _read_raw(d, mi)
-                    meta = _file_meta(d)
-                    keep = {key: d[key] for key in (
-                        "z_value_mm", "z_unit", "angle_value_deg", "angle_unit",
-                        "background", "background_subtracted", "saturation_mask",
-                        "twins_positions_mm", "twins_positions_calibrated_mm")
-                        if key in d.files}
-                if raw is None or pos is None or ref_raw.shape != raw.shape:
-                    skipped += 1
-                    continue
-                nfreq = resolve_n_points(len(pos), manual=self.r_nfreq.value())
-                wl, cube = self.proc.compute_hyperspectral(
-                    pos, raw, wl_start=wl0, wl_stop=wl1, n_freq=nfreq, apod_type=apod,
-                    ft_window_mm=win, expected_zero_mm=DEFAULT_ZPD_MM,
-                    search_mm=DEFAULT_ZPD_WINDOW_MM, positions_calibrated=calibrated,
-                    reference_cube=ref_raw, center_method=cmethod)
-                if cube is None:
-                    skipped += 1
-                    continue
-                meta = dict(meta)
-                meta.update(phase_corrected=True,
-                            phase_background=os.path.basename(self.phase_bkg[2]),
-                            recompute_window_mm=win, recompute_apod=apod,
-                            recompute_nfreq=int(nfreq))
-                kw = dict(wavelengths=wl, spectrum_cube=cube.astype(np.float32),
-                          raw_interferogram=np.asarray(raw, np.float32),
-                          metadata=np.array(meta, dtype=object),
-                          metadata_json=json.dumps(meta, default=str, indent=2))
-                kw.update(keep)
-                base = os.path.splitext(os.path.basename(info["path"]))[0]
-                np.savez(os.path.join(dest, base + ".npz"), **kw)  # uncompressed: fast write
-                saved += 1
-            msg = f"phased + saved {saved} cube(s) to {dest}"
-            if skipped:
-                msg += f"  ({skipped} skipped — no raw / shape mismatch)"
-            self.statusBar().showMessage(msg)
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
 
     def _on_click(self, ev):
         cube = self.current_cube()

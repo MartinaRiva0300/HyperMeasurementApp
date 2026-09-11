@@ -218,7 +218,7 @@ class HyperspectralProcessor:
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
-                               apod_width=0.2, n_freq=200, reference_cube=None, invert=False,
+                               apod_width=0.2, n_freq=200, invert=False,
                                expected_zero_mm=None, search_mm=None,
                                apod_type="gaussian", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
@@ -233,7 +233,6 @@ class HyperspectralProcessor:
         per pixel, so a ZPD that varies across the field is followed per pixel;
         "geometric" = the midpoint sample of the acquired scan, ignoring the
         signal entirely (use when the scan is deliberately centred on ZPD).
-        If reference_cube is provided, extracts spectral phase and returns the Absorptive (Real) part.
 
         `complex_output`: keep the COMPLEX DFT instead of its magnitude, so the
         interferometric phase survives into the saved cube (complex64). Default
@@ -275,17 +274,12 @@ class HyperspectralProcessor:
                 rx = float(walkoff.get("rate_x", 0.0))
                 rm = walkoff.get("ref_mm", None)
                 datacube = apply_walkoff_correction(datacube, positions, ry, rx, rm)
-                if reference_cube is not None:
-                    reference_cube = apply_walkoff_correction(
-                        np.asarray(reference_cube, dtype=float), positions, ry, rx, rm)
                 print(f"[Measurement] walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Measurement: walk-off correction skipped: {e}")
 
         if invert:
             datacube = -datacube
-            if reference_cube is not None:
-                reference_cube = -reference_cube
 
         _method = str(center_method).lower()
         per_pixel = _method.startswith("bary")
@@ -374,12 +368,7 @@ class HyperspectralProcessor:
             apod3 = apod[:, np.newaxis, np.newaxis] if apod.ndim == 1 else apod
             return sig * apod3, center, c_pos
 
-        if reference_cube is not None:
-            reference_cube = np.asarray(reference_cube, dtype=float)
-            ref_signal, fixed_center, ref_pos = preprocess(reference_cube)
-            signal, _, final_pos = preprocess(datacube, force_center=fixed_center, c_pos=ref_pos)
-        else:
-            signal, _, final_pos = preprocess(datacube)
+        signal, _, final_pos = preprocess(datacube)
 
         # Frequency grid
         start_freq, end_freq = self._get_frequency_limits(wl_start, wl_stop)
@@ -401,134 +390,11 @@ class HyperspectralProcessor:
         flat = weighted.reshape(n_pos_final, -1)     # (n_pos, h*w)
         spec_flat = phase_kernel.conj().T @ flat  # (n_freq, h*w)
 
-        # Phase correction
-        if reference_cube is not None:
-            ref_weighted = ref_signal * dpos[:, np.newaxis, np.newaxis]
-            ref_flat = ref_weighted.reshape(n_pos_final, -1)
-            ref_spec_flat = phase_kernel.conj().T @ ref_flat
-
-            phase_correction = np.angle(ref_spec_flat)
-            phased_spec_flat = spec_flat * np.exp(-1j * phase_correction)
-            flat_out = (phased_spec_flat if complex_output
-                        else np.real(phased_spec_flat))
-        else:
-            flat_out = spec_flat if complex_output else np.abs(spec_flat)
+        flat_out = spec_flat if complex_output else np.abs(spec_flat)
         spectrum_cube = flat_out.reshape(n_freq, h, w)
 
-        # Magnitude/absorptive spectra don't need float64 -- float32 halves the
+        # Magnitude spectra don't need float64 -- float32 halves the
         # cube size in RAM and on disk with no meaningful precision loss. The
         # complex form keeps the phase, at 2x the size of the float32 magnitude.
         return wavelengths, spectrum_cube.astype(
             np.complex64 if complex_output else np.float32)
-
-    def compute_complex_map(self, positions, datacube, wavelength_um,
-                            apod_width=0.2, apod_type="gaussian",
-                            expected_zero_mm=None, search_mm=None,
-                            ft_window_mm=None, positions_calibrated=False,
-                            reference_cube=None, center_method="envelope"):
-        """Per-pixel COMPLEX DFT at ONE wavelength -> (complex_map (h,w), info).
-
-        The saved spectrum cube keeps only the DFT magnitude (np.abs), throwing
-        the interferometric PHASE away. This runs the SAME forward transform as
-        compute_hyperspectral -- identical baseline removal, centre-burst (ZPD)
-        detection, apodization and FT window -- but for a single frequency and
-        WITHOUT taking the magnitude, so both the amplitude and the wrapped phase
-        map are available (thermal-hologram view).
-
-        `reference_cube` (a background interferogram of the same shape): the
-        per-pixel BACKGROUND phase is subtracted (complex_map *= exp(-i*angle(ref)))
-        to remove the interferometer's instrumental phase, leaving the true
-        spectral phase -- the same reference phase-correction compute_hyperspectral
-        does. The reference defines the ZPD centre (both use it).
-
-        `info` = {center_mm, freq, n_used, phase_corrected}. (None, {}) if too few.
-        """
-        positions = np.asarray(positions, dtype=float)
-        datacube = np.asarray(datacube, dtype=float)
-        if datacube.ndim != 3 or datacube.shape[0] < 3:
-            return None, {}
-        n_pos, h, w = datacube.shape
-        ref = None
-        if reference_cube is not None:
-            ref = np.asarray(reference_cube, dtype=float)
-            if ref.shape != datacube.shape:
-                ref = None            # incompatible -> ignore, no phase correction
-
-        # Motor-nonlinearity correction (unless the axis is already calibrated) --
-        # same rule as compute_hyperspectral, so the phase matches the saved cube.
-        if not positions_calibrated:
-            try:
-                from instruments.calibration import calibrate_position_axis
-                positions = np.asarray(calibrate_position_axis(positions), dtype=float)
-            except Exception as e:  # noqa: BLE001
-                print(f"[WARN] Measurement phase: motor calibration skipped: {e}")
-
-        # Baseline removal (moving average) + signed-sum centre-burst. When a
-        # reference is given it DEFINES the ZPD centre (both cubes share it).
-        from scipy.ndimage import uniform_filter1d
-        window = max(1, len(positions) // 5)
-        sig = datacube - uniform_filter1d(datacube, size=window, axis=0, mode='nearest')
-        ref_sig = (ref - uniform_filter1d(ref, size=window, axis=0, mode='nearest')
-                   if ref is not None else None)
-        burst_src = ref_sig if ref_sig is not None else sig
-        # ZPD centre: one field-wide envelope value, or an independent per-pixel
-        # barycentre map (same choice as compute_hyperspectral, kept in step so
-        # the phase view matches the recomputed cube).
-        _cm = str(center_method).lower()
-        if _cm.startswith("bary"):
-            center = barycenter_map(burst_src)             # (h, w) index map
-        elif _cm.startswith("geom"):
-            center = len(positions) // 2                   # geometrical midpoint
-        else:
-            center = find_centerburst(np.sum(burst_src, axis=(1, 2)), positions,
-                                      expected_zero_mm, search_mm)
-        scalar = np.ndim(center) == 0
-        cpos_c = positions[center]                         # scalar or (h, w)
-
-        # Apodization (gaussian in position space, or a named FTIR window).
-        if str(apod_type).lower() == "gaussian":
-            sigma = abs(positions[-1] - positions[0]) * apod_width
-            if sigma <= 0:
-                apod = np.ones(len(positions))
-            elif scalar:
-                apod = np.exp(-(positions - cpos_c) ** 2 / (2.0 * sigma ** 2))
-            else:
-                apod = np.exp(-(positions[:, None, None] - cpos_c[None]) ** 2
-                              / (2.0 * sigma ** 2))
-        elif scalar:
-            from instruments.dsp import apodization_window
-            apod = apodization_window(apod_type, len(positions), center)
-        else:
-            from instruments.dsp import apodization_window_map
-            apod = apodization_window_map(apod_type, len(positions), center)
-
-        # FT window: keep the taper if the window contains the ZPD, else a boxcar
-        # (matches compute_hyperspectral's ft_window_mm branch).
-        if ft_window_mm is not None:
-            lo, hi = sorted(float(v) for v in ft_window_mm)
-            inwin = (positions >= lo) & (positions <= hi)
-            if scalar:
-                apod = (apod * inwin) if (lo <= cpos_c <= hi) else inwin.astype(float)
-            else:
-                in_c = (cpos_c >= lo) & (cpos_c <= hi)     # (h, w)
-                box = np.broadcast_to(inwin[:, None, None].astype(float), apod.shape)
-                apod = np.where(in_c[None], apod * inwin[:, None, None], box)
-
-        # Single-frequency DFT for the requested wavelength.
-        freq = self._get_frequency_limits(wavelength_um, wavelength_um)[0]
-        dpos = np.diff(positions)
-        dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0.0)
-        wkernel = ((dpos * apod)[:, np.newaxis, np.newaxis] if apod.ndim == 1
-                   else dpos[:, np.newaxis, np.newaxis] * apod)
-        kernel = np.exp(-2j * np.pi * positions * freq)          # (n_pos,)
-        spec_flat = np.conj(kernel) @ (sig * wkernel).reshape(n_pos, -1)  # (h*w,)
-        complex_map = spec_flat.reshape(h, w)
-        if ref_sig is not None:
-            ref_spec = np.conj(kernel) @ (ref_sig * wkernel).reshape(n_pos, -1)
-            complex_map = complex_map * np.exp(-1j * np.angle(ref_spec.reshape(h, w)))
-        info = {"center_mm": float(cpos_c) if scalar else float(np.median(cpos_c)),
-                "freq": float(freq), "per_pixel_center": not scalar,
-                "n_used": int(np.count_nonzero(apod.any(axis=(1, 2)) if apod.ndim == 3
-                                               else apod)),
-                "phase_corrected": ref_sig is not None}
-        return complex_map, info

@@ -20,5 +20,9 @@ h5py            # only needed for the Measure tab's HDF5 save format
 #    VS redistributables) so the GigE filter driver and jumbo frames are set up.
 #
 #  - SmarAct MCS2 SDK -- the SLC-1750 TWINS wedge stage.
-#    Not on PyPI; install from the MCS2 SDK:
-#        pip install "C:\Program Files\SmarAct\MCS2\SDK\Python\packages\smaract_ctl-1.6.2.zip"
+#    Not on PyPI. A prebuilt, cross-platform wheel is vendored in this repo so it
+#    installs the same way on every machine (no build step, any Python 3):
+#        pip install wheels/smaract_ctl-1.5.3-py3-none-any.whl
+#    (See wheels/README.md for why we ship a wheel instead of the SDK .zip.)
+#    NOTE: the wheel is the Python API only -- the SmarActCTL.dll still comes from
+#    running the SmarAct MCS2 software installer on the machine driving the stage.

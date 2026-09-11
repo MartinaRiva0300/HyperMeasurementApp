@@ -201,6 +201,8 @@ class StagesPanel(QWidget):
     def shutdown(self) -> None:
         try:
             if self.twins.is_connected:
-                self.twins.disconnect()
+                # Match the Disconnect button: leave the wedge where it is on app
+                # close (safe=False), rather than moving it to SAFE_POSITION_MM.
+                self.twins.disconnect(safe=False)
         except Exception:  # noqa: BLE001
             pass

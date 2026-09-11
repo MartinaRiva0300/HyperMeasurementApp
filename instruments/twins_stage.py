@@ -136,6 +136,15 @@ class TwinsStage:
         """Set closed-loop move mode, velocity, acceleration and hold time."""
         ctl = self.ctl
         ch = self.channel
+        # Keep the position sensor powered continuously. In the MCS2 default
+        # POWER_SAVE mode the sensor is powered only during active positioning,
+        # so position polls that land while it is off return NO_SENSOR_PRESENT
+        # (error 0x103). ENABLED keeps get_position() reliable at all times.
+        try:
+            ctl.SetProperty_i32(self.handle, ch, ctl.Property.SENSOR_POWER_MODE,
+                                ctl.SensorPowerMode.ENABLED)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[TwinsStage] could not set sensor power mode: {exc}")
         ctl.SetProperty_i32(self.handle, ch, ctl.Property.MOVE_MODE,
                             ctl.MoveMode.CL_ABSOLUTE)
         ctl.SetProperty_i64(self.handle, ch, ctl.Property.MOVE_VELOCITY,

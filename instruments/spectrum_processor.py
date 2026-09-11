@@ -267,7 +267,7 @@ class SpectrumProcessor:
             return None
 
     def compute_spectrum(self, wl_start=8.0, wl_stop=14.0,
-                         apod_width=0.2, n_points=10000, invert=False, symmetrize=False,
+                         apod_width=0.2, n_points=10000, invert=False,
                          expected_zero_mm=None, search_mm=None, apod_type="gaussian"):
         """Compute spectrum from interferogram using DFT."""
         if self.interferogram is None or self.positions is None:
@@ -296,30 +296,6 @@ class SpectrumProcessor:
         except Exception:  # noqa: BLE001
             pass
 
-        if symmetrize:
-            c_idx = center_idx
-            left_len = c_idx
-            right_len = len(signal) - 1 - c_idx
-
-            if right_len > left_len:
-                tail = signal[c_idx + 1:]
-                sym_signal = np.concatenate([tail[::-1], [signal[c_idx]], tail])
-                pos_diffs = c_positions[c_idx + 1:] - c_positions[c_idx]
-                mirrored_pos = c_positions[c_idx] - pos_diffs[::-1]
-                sym_positions = np.concatenate([mirrored_pos, [c_positions[c_idx]], c_positions[c_idx + 1:]])
-            else:
-                tail = signal[:c_idx]
-                sym_signal = np.concatenate([tail, [signal[c_idx]], tail[::-1]])
-                pos_diffs = c_positions[c_idx] - c_positions[:c_idx]
-                mirrored_pos = c_positions[c_idx] + pos_diffs[::-1]
-                sym_positions = np.concatenate([c_positions[:c_idx], [c_positions[c_idx]], mirrored_pos])
-
-            signal = sym_signal
-            c_positions = sym_positions
-            center_idx = len(signal) // 2
-            self.center_idx = center_idx
-
-        self.symmetrized_signal = signal
         if str(apod_type).lower() == "gaussian":
             apodized = self.apodization(signal, c_positions, apod_width, center_idx=center_idx)
         else:

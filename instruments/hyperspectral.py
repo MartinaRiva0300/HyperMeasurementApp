@@ -166,7 +166,7 @@ class HyperspectralProcessor:
         if not samples_per_cycle or samples_per_cycle <= 0:
             return None
         if self.wavelength_cal is None or self.reciprocal_cal is None:
-            return wl_short_um * 1000.0 / float(samples_per_cycle)
+            return None
         try:
             from scipy.interpolate import interp1d
             fn = interp1d(1.0 / self.wavelength_cal, self.reciprocal_cal,

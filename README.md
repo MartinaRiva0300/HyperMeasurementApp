@@ -139,7 +139,7 @@ ui/
   main_window.py        orchestrator: live view, controls, background, ROI, save
   stages.py             TWINS wedge-stage control panel
   twins_scan.py         live 1-D TWINS interferogram scan
-  measure_kspace.py     the hyperspectral experiment + HyperViewer
+  measure_panel.py     the hyperspectral experiment + HyperViewer
 instruments/          drivers + shared DSP
   twins_stage.py        SmarAct MCS2 driver for the SLC-1750 wedge stage
   subtwinslv.py         step-scan engine (scan / scan_cube)

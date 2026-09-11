@@ -218,7 +218,7 @@ def load_measurement_h5(path: str):
     """Read a file written by `save_measurement_h5`.
 
     Returns `(wavelengths, cubes, z_values, sat_masks)` -- the same tuple
-    `load_kspace_npz` returns -- or None when the file holds no spectrum."""
+    `load_measurement_npz` returns -- or None when the file holds no spectrum."""
     h5py = _require_h5py()
     with h5py.File(path, "r") as f:
         group = f.get("measurement")

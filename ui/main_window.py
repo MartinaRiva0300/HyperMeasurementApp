@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 
 from ui.stages import StagesPanel
 from ui.twins_scan import TwinsScanPanel
-from ui.measure_kspace import MeasurePanel
+from ui.measure_panel import MeasurePanel
 
 
 class MainWindow(QMainWindow):
@@ -119,9 +119,9 @@ class MainWindow(QMainWindow):
             roi_provider=self.get_roi_bounds,
             roi_show=self.set_roi_visible,
             bg_provider=lambda: (self.background_frame, self.use_bg_subtraction),
-            # Save K-space files into the SAME folder set in the camera Save group.
+            # Save Measurement files into the SAME folder set in the camera Save group.
             save_dir_provider=lambda: self.save_dir_edit.text().strip() or self.save_dir,
-            meta_provider=self._kspace_metadata,
+            meta_provider=self._measurement_metadata,
             save_dir=self.save_dir)
         controls_tabs.addTab(self._make_tab([self.measure_panel]), "Measure")
         splitter.addWidget(controls_tabs)
@@ -822,8 +822,8 @@ class MainWindow(QMainWindow):
         if frame is not None:
             self._apply_frame(frame, latest_frame_packet["measurement"])
 
-    def _kspace_metadata(self) -> dict:
-        """Camera state embedded into the saved K-space hypercube metadata."""
+    def _measurement_metadata(self) -> dict:
+        """Camera state embedded into the saved Measurement hypercube metadata."""
         s = self.latest_status or {}
         return {
             "camera_serial": s.get("serial_number"),
@@ -836,7 +836,7 @@ class MainWindow(QMainWindow):
         }
 
     def _apply_status(self, status: dict) -> None:
-        self.latest_status = status     # keep for K-space metadata
+        self.latest_status = status     # keep for Measurement metadata
         self.backend_label.setText(f"Backend: {status.get('backend', 'unknown')}")
         requested_mode = status.get("requested_mode", self.current_mode) or self.current_mode
         self.current_mode = requested_mode

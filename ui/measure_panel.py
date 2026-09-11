@@ -1,4 +1,4 @@
-"""Measure tab -- K-space hyperspectral (per-pixel TWINS spectra).
+"""Measure tab -- Measurement hyperspectral (per-pixel TWINS spectra).
 
 A TWINS wedge scan stores the full 2-D ROI at every position (a datacube), then
 HyperspectralProcessor runs an independent DFT per pixel -> a spectrum cube
@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-# Disk-space guards for saving hypercubes (large files).
+# Dismeasurement guards for saving hypercubes (large files).
 LOW_DISK_WARN_GB = 3.0     # warn once when free space drops below this during a scan
 LOW_DISK_ABORT_GB = 0.5    # abort the scan to avoid failed / truncated saves
 
@@ -102,7 +102,7 @@ def _get_cmap(name):
 class HyperViewer(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("K-Space Hyperspectral Viewer")
+        self.setWindowTitle("Measurement Hyperspectral Viewer")
         self.resize(900, 520)
         self.wavelengths = None
         self.cubes = []          # list of (n_freq, h, w)  (in-RAM mode)
@@ -465,8 +465,8 @@ class LiveInterferogram(QWidget):
         self.curve.setData(self._x, self._y)
 
 
-def load_kspace_npz(path: str):
-    """Read a saved K-space .npz -> (wavelengths, cubes, z_values, sat_masks).
+def load_measurement_npz(path: str):
+    """Read a saved Measurement .npz -> (wavelengths, cubes, z_values, sat_masks).
 
     Works for files saved by MeasurePanel (spectral cube, optional saturation
     masks and raw interferogram). Returns None if the spectral cube is absent.
@@ -486,8 +486,8 @@ def load_kspace_npz(path: str):
     return wl, cubes, z_values, masks
 
 
-def kspace_metadata(path: str) -> dict:
-    """The embedded metadata dict of a saved K-space .npz (or {}). Lets a viewer
+def measurement_metadata(path: str) -> dict:
+    """The embedded metadata dict of a saved Measurement .npz (or {}). Lets a viewer
     show whether the spectra were computed on the calibrated wedge axis."""
     try:
         with np.load(path, allow_pickle=True) as d:
@@ -509,7 +509,7 @@ class MeasurePanel(QWidget):
 
     def __init__(self, stages_panel, frame_source, roi_provider,
                  roi_show=None, bg_provider=None, save_dir_provider=None,
-                 meta_provider=None, save_dir: str = r"D:\CAMERA\kspace") -> None:
+                 meta_provider=None, save_dir: str = r"D:\CAMERA\measurement") -> None:
         super().__init__()
         self.sp = stages_panel
         self.frame_source = frame_source
@@ -562,7 +562,7 @@ class MeasurePanel(QWidget):
         # Persist scan/spectrum params (incl. the wavelength window) between
         # measurements. Restore first, THEN bind saves so restoring doesn't
         # immediately rewrite the same values.
-        self._settings = QtCore.QSettings(SETTINGS_ORG, "KSpace")
+        self._settings = QtCore.QSettings(SETTINGS_ORG, "Measurement")
         self._restore_settings()
         for widget, _cast in self._persisted_spins().values():
             widget.valueChanged.connect(self._save_settings)
@@ -820,7 +820,7 @@ class MeasurePanel(QWidget):
                                       "type/width, apod centre, λ window, N freq) -- no re-scan.")
         self.btn_view = QPushButton("Open Viewer"); self.btn_view.clicked.connect(self._open_viewer)
         self.btn_load = QPushButton("Load"); self.btn_load.clicked.connect(self._load)
-        self.btn_load.setToolTip("Open a saved K-space .npz in the viewer.")
+        self.btn_load.setToolTip("Open a saved Measurement .npz in the viewer.")
         self.btn_save = QPushButton("Save"); self.btn_save.clicked.connect(self._save)
         row2.addWidget(self.btn_recompute); row2.addWidget(self.btn_view)
         row2.addWidget(self.btn_load); row2.addWidget(self.btn_save)
@@ -848,7 +848,7 @@ class MeasurePanel(QWidget):
         row3b.addWidget(QLabel("Format")); row3b.addWidget(self.combo_format, 1)
         v.addLayout(row3b)
         row4 = QHBoxLayout()
-        self.edit_filename = QLineEdit("kspace")
+        self.edit_filename = QLineEdit("measurement")
         self.edit_filename.setToolTip("Base filename; files are saved as "
                                       "<date>.<filename> in the camera's save folder.")
         row4.addWidget(QLabel("Filename")); row4.addWidget(self.edit_filename, 1)
@@ -1035,13 +1035,13 @@ class MeasurePanel(QWidget):
             ft_region="full",
             apod_center=params["center_method"],
             complex_spectrum=params["complex_out"],
-            filename=self.edit_filename.text().strip() or "kspace",
+            filename=self.edit_filename.text().strip() or "measurement",
         )
         # Each Acquire = one experiment "run": save ALL its files into a folder
         # named <run-timestamp>.<filename> under the camera folder.
         camera_folder = (self.save_dir_provider() if self.save_dir_provider
                          else None) or self.save_dir
-        # --- Disk-space check: estimate the data size and warn if the save volume
+        # --- Dismeasurement check: estimate the data size and warn if the save volume
         # is low (do this BEFORE freezing the UI / starting the thread). ---
         frame = self.frame_source()
         if roi is not None:
@@ -1070,7 +1070,7 @@ class MeasurePanel(QWidget):
                 self.sig_status.emit(
                     f"acquisition cancelled -- only {free_gb:.1f} GB free (need ~{est_gb:.1f} GB)")
                 return
-        self._save_fname = self.edit_filename.text().strip() or "kspace"
+        self._save_fname = self.edit_filename.text().strip() or "measurement"
         self._run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_folder = os.path.join(camera_folder, f"{self._run_stamp}.{self._save_fname}")
         self._save_folder = self._run_folder   # the run's files go here
@@ -1265,7 +1265,7 @@ class MeasurePanel(QWidget):
                     self._last_positions = positions
                     acquired.append({"positions": np.asarray(positions),
                                      "datacube": np.asarray(datacube)})
-                    # Disk-space guard. Nothing further is acquired after this
+                    # Dismeasurement guard. Nothing further is acquired after this
                     # point, so warn rather than abort -- aborting here would only
                     # throw away the cube we just spent the whole sweep acquiring.
                     # The final write is guarded by the pre-flight check in _start
@@ -1376,7 +1376,7 @@ class MeasurePanel(QWidget):
         fresh run folder if there is no active scan (e.g. a manual save after Load)."""
         folder = getattr(self, "_run_folder", None)
         stamp = getattr(self, "_run_stamp", None)
-        fname = getattr(self, "_save_fname", None) or self.edit_filename.text().strip() or "kspace"
+        fname = getattr(self, "_save_fname", None) or self.edit_filename.text().strip() or "measurement"
         if not folder or not stamp:
             base = (self.save_dir_provider() if self.save_dir_provider else None) or self.save_dir
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1579,13 +1579,13 @@ class MeasurePanel(QWidget):
                   else None) or self.save_dir
         start = folder if os.path.isdir(folder) else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load K-space measurement", start,
+            self, "Load Measurement measurement", start,
             "Measurements (*.npz *.h5);;NumPy archive (*.npz);;HDF5 (*.h5)")
         if not path:
             return
         try:
             res = (load_measurement_h5(path) if path.lower().endswith(".h5")
-                   else load_kspace_npz(path))
+                   else load_measurement_npz(path))
             if res is None:
                 self.lbl_status.setText("file has no spectral cube")
                 return

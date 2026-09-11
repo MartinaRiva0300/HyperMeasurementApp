@@ -6,7 +6,7 @@ freezes; position is polled on a timer. A "Simulate" checkbox lets you exercise
 the controls with no hardware (default ON until the stage is wired up).
 
 The actual TWINS interferogram scan (sweep stage + read camera ROI -> spectrum)
-lives in ui/twins_scan.py and ui/measure_kspace.py; this panel covers the
+lives in ui/twins_scan.py and ui/measure_panel.py; this panel covers the
 connection + manual control.
 """
 from __future__ import annotations

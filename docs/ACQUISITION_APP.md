@@ -35,7 +35,7 @@ main.py  ──spawns──►  camera_worker (separate PROCESS)  ──► Forg
 MainWindow (ui/main_window.py)  ── QTimer 8 ms poll → self.latest_frame (fresh .copy each frame)
    ├── Camera tab      (exposure, GenICam opts, bad-pixel mask, ROI, colormap, background, save)
    ├── TWINS tab       (StagesPanel.twins_group  +  TwinsScanPanel: live 1-D scan)
-   └── Measure tab     (MeasurePanel: the K-space HYPERSPECTRAL experiment)
+   └── Measure tab     (MeasurePanel: the Measurement HYPERSPECTRAL experiment)
                           frame_source = lambda: self.latest_frame
                           bg_provider, save_dir_provider, meta_provider, roi_provider
 ```
@@ -151,7 +151,7 @@ display range are display-only (don't touch the camera).
 - **Save**: `save_dir_edit` (default `D:\CAMERA`) + `filename_edit`. `save_dir_provider`
   and the camera's "Save image" (TIFF uint16 + NPY + colormapped PNG, stamped
   `YYYYMMDD_HHMMSS.<name>`).
-- **Metadata**: `meta_provider = self._kspace_metadata` returns
+- **Metadata**: `meta_provider = self._measurement_metadata` returns
   `{camera_serial, exposure_ms, averaging, fpa_temp_k, board_temp_c, nuc_corrected,
   save_filename_camera}` from `self.latest_status` — embedded in saved hypercubes.
 - **Status**: `_apply_status` stores `self.latest_status` and updates labels (temps shown
@@ -201,12 +201,12 @@ The **TWINS tab** does a quick scalar interferogram for alignment / single-spect
 
 ---
 
-## 6. The hyperspectral experiment — `MeasurePanel` (`ui/measure_kspace.py`)
+## 6. The hyperspectral experiment — `MeasurePanel` (`ui/measure_panel.py`)
 
 This is the scientific core. It runs a worker thread that drives the TWINS wedge, grabs
 frame stacks, computes per-pixel spectra, and auto-saves the result. Key classes in the
-file: `MeasurePanel`, `HyperViewer`, `LiveInterferogram`; helpers `load_kspace_npz`,
-`kspace_metadata`.
+file: `MeasurePanel`, `HyperViewer`, `LiveInterferogram`; helpers `load_measurement_npz`,
+`measurement_metadata`.
 
 ### Acquisition flow (two-phase worker `_worker`)
 A single **Acquire** = one *run* = **one wedge sweep = one cube**. At `_start`, a per-run
@@ -338,7 +338,7 @@ board temp, backend).
   + `positions_calibrated`). Raw axis is preserved so files can be re-derived with a new cal.
 - **Raw interferogram is always saved** → every file is reprocessable (don't re-add a gate).
 - Persistence via `QSettings` org **"SWIR_CAMERA"** (`SETTINGS_ORG` in
-  `ui/measure_kspace.py`): apps "KSpace"/"TwinsScan"/"HyperViewer". The org is
+  `ui/measure_panel.py`): apps "Measurement"/"TwinsScan"/"HyperViewer". The org is
   deliberately *not* "MIR_CAMERA" — the MWIR app uses that, and sharing it makes the two
   apps silently overwrite each other's saved scan parameters.
 - **Anything that drives the Measure spin boxes persists settings** (every `valueChanged`
@@ -367,7 +367,7 @@ board temp, backend).
 | `ui/main_window.py` | orchestrator: frame poll, latest_frame, controls, bad-pixel mask, save, metadata |
 | `ui/stages.py` | StagesPanel: TWINS wedge UI, StageController threading, freeze() |
 | `ui/twins_scan.py` | live 1-D TWINS scan UI |
-| `ui/measure_kspace.py` | **MeasurePanel**: the hyperspectral experiment + HyperViewer |
+| `ui/measure_panel.py` | **MeasurePanel**: the hyperspectral experiment + HyperViewer |
 | `instruments/twins_stage.py` | SmarAct MCS2 driver for the SLC-1750 wedge stage |
 | `instruments/subtwinslv.py` | TwinsScanner: step-scan engine (`scan`, `scan_cube`) |
 | `instruments/hyperspectral.py` | 2-D per-pixel DFT (`compute_hyperspectral`) |

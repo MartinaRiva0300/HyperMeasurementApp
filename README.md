@@ -1,12 +1,12 @@
 # SWIR Hyperspectral Camera
 
-A PyQt6 acquisition + analysis application for **static SWIR hyperspectral
+A PyQt6 acquisition + analysis application for **VIS-SWIR hyperspectral
 imaging**: a Teledyne FLIR **Forge 1GigE SWIR** camera (1.3 MP, C-mount, Sony
 IMX990 SenSWIR InGaAs, 1280×1024 @ 5 µm) combined with a **NIREOS TWINS**
 common-path birefringent interferometer. The TWINS wedge is stepped by a SmarAct
 **SLC-1750** closed-loop linear piezo stage, N frames are grabbed per step, and a
 per-pixel interferogram is built and Fourier-transformed into a spectral cube.
-Band of interest **~0.9–1.7 µm** (the IMX990 cut-off).
+Band of interest **~0.4–1.7 µm** (the IMX990 cut-off).
 
 The app synchronises exactly two instruments — **the camera and the wedge
 stage** — and nothing else. One `Acquire` = one wedge sweep = one hyperspectral
@@ -164,6 +164,23 @@ per-pixel continuum-subtraction method used to isolate the resonant line image.
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
+ALternatively with conda
+```bat
+create -n env_name python=3.12
+conda activate env_name
+```
+Installing dependencies
+'''bat
+pip install PyQt6, loguru
+conda install -c conda-forge pyqtgraph
+pip install "C:\yourDirectory\spinnaker_python-4.4.0.246-cp312-cp312-win_amd64\spinnaker_python-4.4.0.246-cp312-cp312-win_amd64.whl“
+pip install wheels/smaract_ctl-1.5.3-py3-none-any.whl 
+'''
+Alternatively for dependencies
+'''bat
+pip install -r requirements.txt
+pip install "C:\yourDirectory\spinnaker_python-4.4.0.246-cp312-cp312-win_amd64\spinnaker_python-4.4.0.246-cp312-cp312-win_amd64.whl“
+'''
 
 64-bit Python **3.10 or 3.12** — those are the versions Teledyne ships PySpin
 wheels for. `mock` mode needs only the pip packages. The real hardware

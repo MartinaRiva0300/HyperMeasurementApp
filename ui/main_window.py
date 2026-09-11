@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QSlider,
+    QSplitter,
     QTabWidget,
     QSpinBox,
     QVBoxLayout,
@@ -90,11 +91,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
+        # Controls (left) and viewer (right) live in a draggable splitter so the
+        # settings column can be widened when a panel's rows don't fit -- rather
+        # than being clipped by a fixed width with no way to scroll sideways.
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter)
+
         self.stages_panel = StagesPanel()
 
         controls_tabs = QTabWidget()
         controls_tabs.setMinimumWidth(320)
-        controls_tabs.setMaximumWidth(340)
         controls_tabs.addTab(self._make_tab([
             self._build_camera_group(),
             self._build_processing_group(),
@@ -120,10 +126,18 @@ class MainWindow(QMainWindow):
             meta_provider=self._kspace_metadata,
             save_dir=self.save_dir)
         controls_tabs.addTab(self._make_tab([self.measure_panel]), "Measure")
-        root.addWidget(controls_tabs, 0)
+        splitter.addWidget(controls_tabs)
 
-        viewer_column = QVBoxLayout()
-        root.addLayout(viewer_column, 1)
+        viewer_container = QWidget()
+        viewer_column = QVBoxLayout(viewer_container)
+        viewer_column.setContentsMargins(0, 0, 0, 0)
+        splitter.addWidget(viewer_container)
+
+        # Keep the viewer as the part that grows/shrinks with the window; give the
+        # controls a comfortable default width but let the user drag either way.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 1000])
 
         title = QLabel("Beam Viewer")
         title.setStyleSheet("font-size: 20px; font-weight: 600;")
@@ -247,7 +261,9 @@ class MainWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Show a horizontal scrollbar only when the content is wider than the
+        # column, so nothing is ever clipped out of reach.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(container)
         return scroll
 

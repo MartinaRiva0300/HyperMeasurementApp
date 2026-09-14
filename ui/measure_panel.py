@@ -504,7 +504,7 @@ class MeasurePanel(QWidget):
 
     def __init__(self, stages_panel, frame_source, roi_provider,
                  roi_show=None, bg_provider=None, save_dir_provider=None,
-                 meta_provider=None, save_dir: str = r"D:\CAMERA\measurement") -> None:
+                 meta_provider=None, save_dir: str = r"C:\temp\measurement") -> None:
         super().__init__()
         self.sp = stages_panel
         self.frame_source = frame_source

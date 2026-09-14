@@ -70,7 +70,7 @@ class MainWindow(QMainWindow):
         self.last_display_frame = None
         self._display_levels = (0.0, 16383.0)
         self.profile_pixel = None  # (row, col) for X/Y profiles; None = center
-        self.save_dir = r"D:\CAMERA"
+        self.save_dir = r"C:\temp"
         self.save_filename = "filename"
         self.auto_scale_display = False
         self.frame_count = 0

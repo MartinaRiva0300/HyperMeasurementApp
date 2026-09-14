@@ -49,7 +49,7 @@ cube.
     entirely (use when the scan is already deliberately centred on ZPD).
 
   The first two are found from the acquired data — no expected ZPD position is
-  assumed. The acquisition never phase-corrects; that stays in `analysis_app.py`.
+  assumed.
 - **Save complex spectrum (keep phase)** — writes the cube as `complex64`
   (**float32 real + float32 imag**), keeping the interferometric phase alongside
   the amplitude instead of the `float32` magnitude alone. The precision is
@@ -58,72 +58,47 @@ cube.
   that can carry phase. Both save paths pin the dtype to `complex64`, so nothing
   can upcast to `complex128`. The viewer, the maps and the ROI-average CSV always
   display `|spectrum|`, so nothing changes on screen. Off by default.
-- **Save format** selectable per run: NumPy `.npz` (default) or **HDF5** in the
-  ScopeFoundry layout — see below.
+- **Save format** is HDF5 only: every run writes the two MATLAB-compatible
+  hypercube files — see below.
 - Built-in **HyperViewer**: λ-scrub / peak-λ / peak-intensity / SAM /
   **continuum-line** maps, per-pixel spectra, colormaps.
 
 **Analysis**
-- A standalone analyzer (`analysis_app.py`), a Stokes-polarimetry app
-  (`stokes_app.py`, `stokes_maps_app.py`) and a lightweight cube viewer
-  (`view_hyperspectral.py`) for the saved `.npz` hypercubes.
+- Hypercubes are analysed in external, pre-existing tools that read the saved
+  HDF5 files (see below). A lightweight in-repo cube viewer
+  (`view_hyperspectral.py`) can also open past scans.
 
 ## Save formats
 
-The Measure tab's **Format** box picks how the full cube is written. The
-ROI-average CSV is unaffected by it.
+Every run writes **two HDF5 files** into its run folder, in the layout the lab's
+pre-existing MATLAB analysis codes expect. Spatial axes come first in both cubes.
+HDF5 is the only format (it needs `h5py`; saving reports a clear error without
+it). The ROI-average CSV is unaffected. The Measure tab's Load button reads the
+spectral file back for viewing.
 
-**NumPy `.npz` (default)** — `<run-stamp>.<filename>.npz` in the run folder.
-This is what `analysis_app.py`, `view_hyperspectral.py` and the Measure tab's own
-Load button read, so leave it selected unless you specifically need HDF5.
-
-**HDF5 `.h5`** — `<yymmdd_HHMMSS>_hyper[_<filename>].h5`, written in the
-ScopeFoundry `h5_io` layout so the lab's other tooling can read it. The Filename
-box supplies the **sample** name; the timestamp is taken from the run stamp so
-the file and its run folder always agree.
-
-The measurement group is **`hyper`** (`MEASUREMENT_NAME` in
-`instruments/h5_writer.py`), matching the MATLAB reader's
-`/measurement/hyper/t0/c0/`. Renaming it breaks that reader.
-
-**Units:** the app works in millimetres internally, but the HDF5 position
-datasets are written in **micrometres** — that is what the MATLAB reader expects.
-The datasets keep their historical `position_mm` *name* (the reader opens that
-path) while holding µm *values*, so every one carries an explicit `units` attr to
-remove the ambiguity. The conversion happens only at the HDF5 write boundary; the
-`.npz` format still stores millimetres in `raw_positions`.
+**`<run-stamp>.<filename>_hyp.h5`** — temporal hypercube:
 
 ```
-/                                    attrs: created, time_id, sample, measurement
-/app/settings                        attrs: save_dir, sample
-/measurement/hyper/
-    settings/                        every scan setting, as attributes
-    t0/c0/image                      (n_pos, h, w)  the raw interferogram
-                                     attrs: element_size_um = [z, y, x]
-    t0/c0/position_mm                (n_pos,) float32  wedge axis in MICROMETRES
-    t0/c0/position_mm_calibrated     (n_pos,) the axis the DFT actually used
-    spectrum/wavelengths             (n_freq,) µm
-    spectrum/cube                    (1, n_freq, h, w) float32
-    masks/saturation                 (1, h, w) bool          [if enabled]
-    background/map                   (h, w)   attrs: subtracted   [if captured]
-    acquisition                      attrs: roi, binning, n_positions
-    metadata_json                    the complete metadata, verbatim
+HyperMatrix     interferogram cube, axes (x=cols, y=rows, time=motor steps)
+t               raw (non-corrected) motor positions
+t_corr          motor-nonlinearity-corrected positions
+file_tot_del    full path of the motor-position calibration file (parameters_int.txt)
 ```
 
-`t0/c0/image` is this app's raw interferogram cube and `t0/c0/position_mm` its
-raw positions, exactly as in the ScopeFoundry structure. Two notes:
+**`<run-stamp>.<filename>_SpectralHypercube.h5`** — spectral hypercube:
 
-- `element_size_um` defaults to **[1, 1, 1]**. Set `DEFAULT_ELEMENT_SIZE_UM` in
-  `instruments/h5_writer.py` if you want a physical voxel size in Fiji (z = wedge
-  step µm, y/x = 5 µm pitch × binning ÷ magnification). The true step size and
-  binning are in the metadata regardless.
-- `t0/c0/image` is **float32**, not the camera's uint16: frames are averaged and
-  the background subtracted before the cube is stored, so it is the processed
-  interferogram rather than raw counts.
+```
+Hyperspectrum_cube   spectrum cube, axes (x=cols, y=rows, freq); complex64 if phase kept
+fr_real              optical frequency c/λ, in THz
+f                    stage pseudo-frequency axis (after the FT over motor positions)
+file_totCal          full path of the spectral calibration file (parameters_cal.txt)
+/settings            attrs: the Spectrum-subpanel settings used (apod, λ window, N freq, …)
+```
 
-HDF5 needs `h5py`; without it the format simply reports an error and `.npz`
-keeps working. Because the raw interferogram *is* the primary dataset, a cube
-loaded from an old file (which carries no raw data) cannot be re-saved as HDF5.
+The optical frequency is `fr_real[THz] = 299.792458 / λ[µm]`; the wavelength axis
+is recoverable as `λ = 299.792458 / fr_real`. When "Save complex spectrum" is on,
+`Hyperspectrum_cube` is stored as `complex64` (float32 real + imag) to keep the
+interferometric phase; the viewer always shows `|spectrum|`.
 
 ## Layout
 
@@ -225,8 +200,7 @@ this instrument**:
 
 You still need to know roughly where ZPD is in order to choose the scan
 Start/Stop, but the app no longer assumes a value: the apodization centre is
-located in whatever you acquired. (`DEFAULT_ZPD_MM = 24.33` survives in
-`instruments/hyperspectral.py` only for `analysis_app.py`.)
+located in whatever you acquired.
 
 Nyquist also bites harder in SWIR than MWIR: resolving 0.9 µm needs a far finer
 wedge step than 4 µm did. The Measure tab shows the maximum permitted step and

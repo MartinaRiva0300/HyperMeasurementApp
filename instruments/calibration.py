@@ -51,8 +51,9 @@ _POSITION_PATHS = [
 # Module-level caches: None = not yet attempted, (a, b) = loaded,
 # (None, None) = tried and failed (don't retry every call).
 _spectral_cache = None
+_spectral_path = None    # FULL path of the spectral-cal file actually loaded
 _position_cache = None
-_position_path = None    # name of the position-cal file actually loaded
+_position_path = None    # FULL path of the position-cal file actually loaded
 
 
 def _read_two_row_file(path: Path):
@@ -65,7 +66,7 @@ def _read_two_row_file(path: Path):
 
 def get_spectral_calibration():
     """Return (wavelength_cal_um, reciprocal_cal) or (None, None)."""
-    global _spectral_cache
+    global _spectral_cache, _spectral_path
     if _spectral_cache is not None:
         return _spectral_cache
     for p in _SPECTRAL_PATHS:
@@ -75,6 +76,7 @@ def get_spectral_calibration():
                 print(f"[OK] Loaded spectral calibration: {p.name}  "
                       f"({wl.min():.2f}-{wl.max():.2f} µm)")
                 _spectral_cache = (wl, rk)
+                _spectral_path = str(Path(p).resolve())
                 return _spectral_cache
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Could not read spectral calibration {p}: {e}")
@@ -98,7 +100,7 @@ def get_position_calibration():
                 pos, amp = _read_two_row_file(p)
                 print(f"[OK] Loaded position calibration: {p.name}")
                 _position_cache = (pos, amp)
-                _position_path = p.name
+                _position_path = str(Path(p).resolve())
                 return _position_cache
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Could not read position calibration {p}: {e}")
@@ -107,13 +109,22 @@ def get_position_calibration():
     return _position_cache
 
 
+def spectral_calibration_status():
+    """(available: bool, path: str|None) for the spectral calibration
+    (parameters_cal.txt). `path` is the FULL path of the file that loaded, so
+    callers can record exactly which calibration a saved cube used."""
+    wl, rk = get_spectral_calibration()
+    return (wl is not None and rk is not None), _spectral_path
+
+
 def position_calibration_status():
-    """(available: bool, filename: str|None) for the motor-nonlinearity cal.
+    """(available: bool, path: str|None) for the motor-nonlinearity cal.
 
     `available` is True only when parameters_int.txt loaded successfully, i.e.
     calibrate_position_axis() will actually correct the axis (not pass it
-    through unchanged). Lets callers record in metadata whether the saved
-    spectra were computed on the calibrated wedge axis.
+    through unchanged). `path` is the FULL path of the file that loaded. Lets
+    callers record whether the saved spectra were computed on the calibrated
+    wedge axis, and exactly which calibration file was used.
     """
     pos, amp = get_position_calibration()
     return (pos is not None and amp is not None), _position_path

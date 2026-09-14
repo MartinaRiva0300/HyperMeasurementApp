@@ -1,8 +1,9 @@
 # SWIR Acquisition App: technical handoff
 
 Audience: an AI agent (or developer) taking over the **live acquisition app**. This
-explains the architecture and the *logic*, not every line. The analyzer is
-documented separately (`analysis_app.py`).
+explains the architecture and the *logic*, not every line. Saved hypercubes are
+analysed in external, pre-existing tools that read the two HDF5 files each run
+writes (see the README's *Save formats*).
 
 > Scope: **static hyperspectral imaging** — a Teledyne FLIR **Forge 1GigE SWIR**
 > camera (Sony IMX990 SenSWIR, 1280×1024 @ 5 µm) + a **NIREOS TWINS** common-path
@@ -224,8 +225,8 @@ captured once; `_run_target()` returns `(folder, stamp, fname)`).
 
 The two phases are still separate (rather than transforming inside the sweep) because the
 per-pixel DFT is slow and must not sit between wedge steps. The `cubes` / `z_values` lists
-they fill are kept **single-entry with `z = None`**, purely so the saved `.npz` keeps the
-stacked layout the viewer and `analysis_app.py` already read.
+they fill are kept **single-entry with `z = None`**, purely so the saved cube keeps a
+stacked layout the viewer already reads.
 
 **Disk guards.** `_start` estimates the run size (`(n_pos + n_freq) × h × w × 4` bytes) and
 refuses to start — with a confirm dialog — if the save volume is short. Mid-run the worker
@@ -292,7 +293,8 @@ written as HDF5; `_save_cube_h5` raises and `_save` surfaces it.
 λ slider (the Z slider stays hidden — there is no Z axis), maps
 (λ-slice/Peak-λ/Peak-intensity/SAM), colormap/gamma, pixel spectra,
 and a calibration badge via `set_calibration_note(meta)`. `set_result` (in-RAM) /
-`set_result_lazy` (per-Z lazy load). The big **analysis** app is separate (`analysis_app.py`).
+`set_result_lazy` (per-Z lazy load). Full analysis is done in external tools that
+read the saved HDF5 files.
 
 ### Metadata captured at scan start (`_scan_meta` + `_cam_meta`)
 start/stop/steps/step_um, frames/point, binning, ROI, apodization+width, wl range,

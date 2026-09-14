@@ -157,6 +157,19 @@ class HyperspectralProcessor:
             return 1.0 / fn(frequencies)
         return 1.0 / frequencies
 
+    def pseudo_frequencies(self, wavelengths_um):
+        """Stage pseudo-frequency axis (1/mm reciprocal, the DFT frequency axis
+        after the FT over motor positions) for each wavelength. Inverse of
+        _freq_to_wavelength -- lets callers recover the `f` axis from the saved
+        wavelength axis."""
+        wl = np.asarray(wavelengths_um, dtype=float)
+        if self.wavelength_cal is not None and self.reciprocal_cal is not None:
+            from scipy.interpolate import interp1d
+            fn = interp1d(1.0 / self.wavelength_cal, self.reciprocal_cal,
+                          kind="linear", fill_value="extrapolate")
+            return fn(1.0 / wl)
+        return 1.0 / wl
+
     # -- scan-parameter estimation (imported from sub_twins_lw) --------------
     def max_step_um(self, wl_short_um, samples_per_cycle=5):
         """Maximum stage step (µm) for `samples_per_cycle` points per optical

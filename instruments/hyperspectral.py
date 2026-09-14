@@ -182,24 +182,23 @@ class HyperspectralProcessor:
         """Nyquist (2 samples/cycle) stage step at the shortest wavelength."""
         return self.max_step_um(wl_short_um, samples_per_cycle=2)
 
-    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="gaussian"):
+    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
         """Spectral resolution (FWHM, nm) from the stage scan range, using the
         calibration's local slope (accounts for TWINS birefringence). The stage
-        pseudo-frequency FWHM is 1/L for the legacy gaussian, or the apodization-
-        broadened FWHM (FFT of the window) for a named FTIR window."""
+        pseudo-frequency FWHM is the apodization-broadened FWHM (FFT of the
+        window) for the chosen FTIR window."""
         if not scan_range_mm or scan_range_mm <= 0:
             return None
         if not wl_center_um or wl_center_um <= 0:
             return None
         delta_recip = 1.0 / scan_range_mm
-        if apod_type and str(apod_type).lower() != "gaussian":
-            try:
-                from instruments.dsp import apodization_fwhm
-                fwhm = apodization_fwhm(apod_type, scan_range_mm)
-                if fwhm:
-                    delta_recip = fwhm
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            from instruments.dsp import apodization_fwhm
+            fwhm = apodization_fwhm(apod_type, scan_range_mm)
+            if fwhm:
+                delta_recip = fwhm
+        except Exception:  # noqa: BLE001
+            pass
         if self.wavelength_cal is None or self.reciprocal_cal is None:
             return (wl_center_um ** 2) * delta_recip * 1000.0
         try:
@@ -218,9 +217,9 @@ class HyperspectralProcessor:
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
-                               apod_width=0.2, n_freq=200, invert=False,
+                               n_freq=200, invert=False,
                                expected_zero_mm=None, search_mm=None,
-                               apod_type="gaussian", walkoff=None,
+                               apod_type="happ-genzel", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
                                positions_calibrated=False, center_method="envelope",
                                complex_output=False):
@@ -326,17 +325,7 @@ class HyperspectralProcessor:
             except Exception:
                 pass
 
-            if str(apod_type).lower() == "gaussian":
-                sigma = abs(c_pos[-1] - c_pos[0]) * apod_width
-                if sigma > 0:
-                    if scalar:
-                        apod = np.exp(-(c_pos - cpos_c)**2 / (2.0 * sigma**2))
-                    else:
-                        apod = np.exp(-(c_pos[:, None, None] - cpos_c[None])**2
-                                      / (2.0 * sigma**2))
-                else:
-                    apod = np.ones(len(c_pos))
-            elif scalar:
+            if scalar:
                 from instruments.dsp import apodization_window
                 apod = apodization_window(apod_type, len(c_pos), center)
             else:

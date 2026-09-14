@@ -142,45 +142,6 @@ class SpectrumProcessor:
         ser = pd.Series(data)
         return ser.rolling(window=window, min_periods=1, center=True).mean().to_numpy()
 
-    def apodization(self, data, positions, width=0.2, center_idx=None):
-        """Apply Gaussian apodization window (NIREOS formula)."""
-        if center_idx is None:
-            center_idx = find_centerburst(data, positions)
-
-        try:
-            print(f"[SpectrumProcessor] Computed ZERO (burst center): {positions[center_idx]:.4f} mm (index {center_idx})")
-        except Exception:
-            pass
-
-        # Shift positions so that center burst is mathematically exactly 0
-        shifted_positions = positions - positions[center_idx]
-
-        left_pos = shifted_positions[:center_idx + 1]
-        right_pos = shifted_positions[center_idx + 1:]
-
-        if len(left_pos) > 0 and left_pos[0] != 0:
-            left_gauss = np.exp(-np.power(left_pos, 2) /
-                                (2 * np.power(left_pos[0] * width * 2, 2)))
-        else:
-            left_gauss = np.ones_like(left_pos)
-
-        if len(right_pos) > 0 and right_pos[-1] != 0:
-            right_gauss = np.exp(-np.power(right_pos, 2) /
-                                 (2 * np.power(right_pos[-1] * width * 2, 2)))
-        else:
-            right_gauss = np.ones_like(right_pos)
-
-        window = np.concatenate([left_gauss, right_gauss])
-
-        if len(window) != len(data):
-            window = np.interp(
-                np.linspace(0, 1, len(data)),
-                np.linspace(0, 1, len(window)),
-                window
-            )
-
-        return data * window
-
     def _get_frequency_limits(self, wl_start, wl_stop):
         if self.wavelength_cal is not None and self.reciprocal_cal is not None:
             from scipy.interpolate import interp1d
@@ -232,24 +193,23 @@ class SpectrumProcessor:
         """Nyquist (2 samples/cycle) stage step at the shortest wavelength."""
         return self.max_step_um(wl_short_um, samples_per_cycle=2)
 
-    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="gaussian"):
+    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
         """Spectral resolution (FWHM, nm) from the stage scan range, using the
         calibration's local slope d(reciprocal)/d(1/λ) so TWINS birefringence +
-        wedge geometry are accounted for. Δk = 1/L for the legacy gaussian, or the
-        apodization-broadened FWHM (FFT of the window) for a named FTIR window."""
+        wedge geometry are accounted for. Δk is the apodization-broadened FWHM
+        (FFT of the window) for the chosen FTIR window."""
         if not scan_range_mm or scan_range_mm <= 0:
             return None
         if not wl_center_um or wl_center_um <= 0:
             return None
         delta_recip = 1.0 / scan_range_mm
-        if apod_type and str(apod_type).lower() != "gaussian":
-            try:
-                from instruments.dsp import apodization_fwhm
-                fwhm = apodization_fwhm(apod_type, scan_range_mm)
-                if fwhm:
-                    delta_recip = fwhm
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            from instruments.dsp import apodization_fwhm
+            fwhm = apodization_fwhm(apod_type, scan_range_mm)
+            if fwhm:
+                delta_recip = fwhm
+        except Exception:  # noqa: BLE001
+            pass
         if self.wavelength_cal is None or self.reciprocal_cal is None:
             return (wl_center_um ** 2) * delta_recip * 1000.0
         try:
@@ -267,8 +227,8 @@ class SpectrumProcessor:
             return None
 
     def compute_spectrum(self, wl_start=8.0, wl_stop=14.0,
-                         apod_width=0.2, n_points=10000, invert=False,
-                         expected_zero_mm=None, search_mm=None, apod_type="gaussian"):
+                         n_points=10000, invert=False,
+                         expected_zero_mm=None, search_mm=None, apod_type="happ-genzel"):
         """Compute spectrum from interferogram using DFT."""
         if self.interferogram is None or self.positions is None:
             return None, None
@@ -296,12 +256,9 @@ class SpectrumProcessor:
         except Exception:  # noqa: BLE001
             pass
 
-        if str(apod_type).lower() == "gaussian":
-            apodized = self.apodization(signal, c_positions, apod_width, center_idx=center_idx)
-        else:
-            from instruments.dsp import apodization_window
-            window = apodization_window(apod_type, len(signal), center_idx)
-            apodized = signal * window
+        from instruments.dsp import apodization_window
+        window = apodization_window(apod_type, len(signal), center_idx)
+        apodized = signal * window
 
         start_freq, end_freq = self._get_frequency_limits(wl_start, wl_stop)
         frequencies = np.linspace(end_freq, start_freq, n_points)

@@ -25,8 +25,9 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSlider,
+    QSpinBox,
     QVBoxLayout, QWidget,
 )
 
@@ -848,6 +849,22 @@ class MeasurePanel(QWidget):
                                       "<date>.<filename> in the camera's save folder.")
         row4.addWidget(QLabel("Filename")); row4.addWidget(self.edit_filename, 1)
         v.addLayout(row4)
+        # Save folder for measurements. Prefilled with the camera Save folder, but
+        # can be pointed anywhere here (overrides the camera folder for the Measure
+        # tab). The per-run <stamp>.<filename> subfolder is created inside it.
+        row4b = QHBoxLayout()
+        initial_dir = (self.save_dir_provider() if self.save_dir_provider
+                       else None) or self.save_dir
+        self.edit_save_dir = QLineEdit(initial_dir)
+        self.edit_save_dir.setToolTip("Folder measurements are saved in (the "
+                                      "<date>.<filename> run folder is created here). "
+                                      "Overrides the camera Save folder for the Measure tab.")
+        self.edit_save_dir.editingFinished.connect(self._save_settings)
+        self.btn_browse_dir = QPushButton("Browse…")
+        self.btn_browse_dir.clicked.connect(self._choose_save_dir)
+        row4b.addWidget(QLabel("Save dir")); row4b.addWidget(self.edit_save_dir, 1)
+        row4b.addWidget(self.btn_browse_dir)
+        v.addLayout(row4b)
         self.chk_save_raw = QCheckBox("Raw interferogram saved for reprocessing (always)")
         self.chk_save_raw.setToolTip("The raw (positions, datacube) is ALWAYS stored "
                                      "in the .npz so you can reprocess offline (FT window / "
@@ -860,6 +877,23 @@ class MeasurePanel(QWidget):
         self.lbl_status = QLabel("idle"); self.lbl_status.setStyleSheet("color:#888; font-size:11px;")
         self.lbl_status.setWordWrap(True); v.addWidget(self.lbl_status)
         return g
+
+    # -- save folder ---------------------------------------------------------
+    def _save_dir(self) -> str:
+        """Folder measurements are saved in: the Measure-tab 'Save dir' field if
+        set, else the camera Save folder, else the built-in default."""
+        chosen = self.edit_save_dir.text().strip()
+        if chosen:
+            return chosen
+        return (self.save_dir_provider() if self.save_dir_provider
+                else None) or self.save_dir
+
+    def _choose_save_dir(self) -> None:
+        start = self.edit_save_dir.text().strip() or self._save_dir()
+        chosen = QFileDialog.getExistingDirectory(self, "Measurement save folder", start)
+        if chosen:
+            self.edit_save_dir.setText(chosen)
+            self._save_settings()
 
     # -- small spin helpers --------------------------------------------------
     def _mm_spin(self, val):
@@ -922,6 +956,9 @@ class MeasurePanel(QWidget):
         fn = self._settings.value("ks_filename", None)
         if fn is not None:
             self.edit_filename.setText(str(fn))
+        sd = self._settings.value("ks_save_dir", None)
+        if sd:
+            self.edit_save_dir.setText(str(sd))
 
     def _save_settings(self, *args) -> None:
         for key, (widget, _cast) in self._persisted_spins().items():
@@ -934,6 +971,7 @@ class MeasurePanel(QWidget):
         for key, chk in self._persisted_checks().items():
             self._settings.setValue(key, chk.isChecked())
         self._settings.setValue("ks_filename", self.edit_filename.text())
+        self._settings.setValue("ks_save_dir", self.edit_save_dir.text())
 
     def _update_step(self) -> None:
         n = self.spin_steps.value()
@@ -1033,8 +1071,7 @@ class MeasurePanel(QWidget):
         )
         # Each Acquire = one experiment "run": save ALL its files into a folder
         # named <run-timestamp>.<filename> under the camera folder.
-        camera_folder = (self.save_dir_provider() if self.save_dir_provider
-                         else None) or self.save_dir
+        camera_folder = self._save_dir()
         # --- Dismeasurement check: estimate the data size and warn if the save volume
         # is low (do this BEFORE freezing the UI / starting the thread). ---
         frame = self.frame_source()
@@ -1372,7 +1409,7 @@ class MeasurePanel(QWidget):
         stamp = getattr(self, "_run_stamp", None)
         fname = getattr(self, "_save_fname", None) or self.edit_filename.text().strip() or "measurement"
         if not folder or not stamp:
-            base = (self.save_dir_provider() if self.save_dir_provider else None) or self.save_dir
+            base = self._save_dir()
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             folder = os.path.join(base, f"{stamp}.{fname}")
         os.makedirs(folder, exist_ok=True)
@@ -1480,7 +1517,7 @@ class MeasurePanel(QWidget):
         cal = None
         if getattr(self, "raw_positions", None):
             cal = [self._position_calibration(pp)[0] for pp in self.raw_positions]
-        base = (self.save_dir_provider() if self.save_dir_provider else None) or self.save_dir
+        base = self._save_dir()
         return save_measurement_h5(
             self._h5_path(stem),
             raw_cubes=getattr(self, "raw_cubes", None) or [],
@@ -1568,9 +1605,7 @@ class MeasurePanel(QWidget):
             self.lbl_status.setText(f"save error: {e}")
 
     def _load(self) -> None:
-        from PyQt6.QtWidgets import QFileDialog
-        folder = (self.save_dir_provider() if self.save_dir_provider
-                  else None) or self.save_dir
+        folder = self._save_dir()
         start = folder if os.path.isdir(folder) else ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Measurement measurement", start,

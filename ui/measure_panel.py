@@ -557,7 +557,6 @@ class MeasurePanel(QWidget):
             widget.valueChanged.connect(self._save_settings)
         self.combo_apod.currentTextChanged.connect(self._save_settings)
         self.chk_walkoff.toggled.connect(self._save_settings)
-        self.combo_save.currentTextChanged.connect(self._save_settings)
         self.chk_save_raw.toggled.connect(self._save_settings)
         for chk in self._persisted_checks().values():   # sat, svd
             chk.toggled.connect(self._save_settings)
@@ -808,17 +807,6 @@ class MeasurePanel(QWidget):
         row2.addWidget(self.btn_recompute); row2.addWidget(self.btn_view)
         row2.addWidget(self.btn_load); row2.addWidget(self.btn_save)
         v.addLayout(row2)
-        row3 = QHBoxLayout()
-        self.combo_save = QComboBox()
-        self.combo_save.addItems(["Full cube (every pixel)", "ROI average", "Both"])
-        self.combo_save.setCurrentText("Both")
-        self.combo_save.setToolTip(
-            "What 'Save' writes:\n"
-            "  Full cube  -> the two HDF5 hypercubes (_hyp + _SpectralHypercube)\n"
-            "  ROI average -> mean±std spectrum over the acquired ROI (.csv)\n"
-            "  Both -> both.")
-        row3.addWidget(QLabel("Save as")); row3.addWidget(self.combo_save, 1)
-        v.addLayout(row3)
         row4 = QHBoxLayout()
         self.edit_filename = QLineEdit("measurement")
         self.edit_filename.setToolTip("Base filename; files are saved as "
@@ -919,9 +907,6 @@ class MeasurePanel(QWidget):
         wo = self._settings.value("ks_walkoff_on", None)
         if wo is not None:
             self.chk_walkoff.setChecked(str(wo).lower() == "true")
-        save_mode = self._settings.value("ks_save_mode", None)
-        if save_mode is not None:
-            self.combo_save.setCurrentText(str(save_mode))
         for key, chk in self._persisted_checks().items():
             v = self._settings.value(key, None)
             if v is not None:
@@ -939,7 +924,6 @@ class MeasurePanel(QWidget):
         self._settings.setValue("ks_apod_type", self.combo_apod.currentText())
         self._settings.setValue("ks_apod_center", self.combo_center.currentText())
         self._settings.setValue("ks_walkoff_on", self.chk_walkoff.isChecked())
-        self._settings.setValue("ks_save_mode", self.combo_save.currentText())
         for key, chk in self._persisted_checks().items():
             self._settings.setValue(key, chk.isChecked())
         self._settings.setValue("ks_filename", self.edit_filename.text())
@@ -1408,33 +1392,6 @@ class MeasurePanel(QWidget):
         self.viewer.show()
         self.viewer.raise_()
 
-    def _roi_average(self):
-        """Spatial mean & std spectrum over each cube (the acquired ROI),
-        excluding saturated pixels. Returns (wavelengths, means, stds) with
-        means/stds shaped (n_z, n_freq)."""
-        from instruments.analysis import roi_average
-        wl = np.asarray(self.wavelengths)
-        masks = getattr(self, "sat_masks", None) or [None] * len(self.cubes)
-        ms = [roi_average(c, masks[i] if i < len(masks) else None)
-              for i, c in enumerate(self.cubes)]
-        means = np.array([m[0] for m in ms])
-        stds = np.array([m[1] for m in ms])
-        return wl, means, stds
-
-    def _save_roi_average_csv(self, stem: str) -> str:
-        """Write the ROI-average spectrum/spectra as a CSV: wavelength_um, then a
-        mean & std column per z map."""
-        wl, means, stds = self._roi_average()
-        cols = [wl]
-        header = ["wavelength_um"]
-        for zi, z in enumerate(self.z_values):
-            tag = "" if z is None else f"_z{z:.4f}mm"
-            cols += [means[zi], stds[zi]]
-            header += [f"mean{tag}", f"std{tag}"]
-        np.savetxt(stem + "_roi_avg.csv", np.column_stack(cols),
-                   delimiter=",", header=",".join(header), comments="")
-        return stem + "_roi_avg.csv"
-
     def _build_metadata(self) -> dict:
         """Scan parameters + camera state describing the saved hypercube."""
         meta = dict(self._scan_meta or {})
@@ -1480,48 +1437,46 @@ class MeasurePanel(QWidget):
         return written[0]
 
     # -- MATLAB-compatible export (for pre-existing analysis codes) -----------
-    def _write_hyper_file(self, stem: str, data: dict, settings: dict | None = None) -> str:
-        """Write one hypercube file as HDF5 (`.h5`). Array entries become datasets;
-        string entries (calibration paths) become scalar UTF-8 string datasets;
-        `settings` becomes attrs on a /settings group. Requires h5py (the only
-        save format) -- raises a clear error if it is not installed."""
+    def _write_spectral_hypercube_h5(self, stem: str, cube_fyx, f_axis, fr_real,
+                                     satmap, cal_path) -> str:
+        """Write the spectral hypercube in the pre-existing MATLAB SpectralHypercube
+        layout:
+
+            /SpectralHypercube/Hyperspectrum_cube  float32 -> MATLAB h5read (reversing
+                                   dims) returns (x, y, slices). (n_freq, y, x) for
+                                   the magnitude; (2*n_freq, y, x) when "Save complex
+                                   spectrum" is on -- the real slices followed by the
+                                   imaginary slices (f/fr_real keep n_freq).
+            /SpectralHypercube/f                   (n_freq, 1) float64  stage
+                                   pseudo-frequency axis (after the FT over t)
+            /SpectralHypercube/fr_real             (n_freq, 1) float64  optical
+                                   frequency c/lambda, in THz
+            /SpectralHypercube/saturationMap       (y, x) float64  1 = valid pixel,
+                                   0 = saturated
+            /file_totCal                           (1,) fixed-length string, the
+                                   spectral calibration file path (at the ROOT)."""
         try:
             import h5py
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(
                 "h5py is required to save (HDF5 is the only save format). "
                 "Install it with: pip install h5py") from e
-        path = stem + ".h5"
+        path = stem + "_SpectralHypercube.h5"
         with h5py.File(path, "w") as f:
-            for k, v in data.items():
-                f.create_dataset(k, data=v)         # h5py stores python str as vlen utf-8
-            if settings:
-                g = f.create_group("settings")
-                for k, v in settings.items():
-                    try:
-                        g.attrs[k] = "None" if v is None else v
-                    except Exception:  # noqa: BLE001
-                        g.attrs[k] = str(v)
+            g = f.create_group("SpectralHypercube")
+            # Real float32: magnitude, or stacked real+imag slices when phase kept.
+            g.create_dataset("Hyperspectrum_cube",
+                             data=np.ascontiguousarray(cube_fyx, dtype=np.float32))
+            g.create_dataset("f",
+                             data=np.asarray(f_axis, dtype=np.float64).reshape(-1, 1))
+            g.create_dataset("fr_real",
+                             data=np.asarray(fr_real, dtype=np.float64).reshape(-1, 1))
+            g.create_dataset("saturationMap",
+                             data=np.asarray(satmap, dtype=np.float64))
+            s = (cal_path or "").encode("utf-8")
+            f.create_dataset("file_totCal",
+                             data=np.array([s], dtype="S%d" % max(len(s), 1)))
         return path
-
-    def _spectrum_settings_summary(self) -> dict:
-        """The Spectrum (per-pixel DFT) subpanel state that produced the spectral
-        hypercube, stored alongside it so a saved cube is self-describing."""
-        m = dict(self._scan_meta or {})
-        n_used = int(len(self.wavelengths)) if self.wavelengths is not None else 0
-        return {
-            "apod_type": str(m.get("apodization", self.combo_apod.currentText())),
-            "wl_start_um": float(m.get("wl_start_um", self.spin_wl0.value())),
-            "wl_stop_um": float(m.get("wl_stop_um", self.spin_wl1.value())),
-            "n_freq_setting": int(m.get("n_freq_setting", self.spin_nfreq.value())),  # 0 = Auto
-            "n_freq_used": n_used,
-            "apod_center": str(m.get("apod_center", self._center_method())),
-            "complex_spectrum": bool(m.get("complex_spectrum", self.chk_complex.isChecked())),
-            "ft_region": str(m.get("ft_region", "full")),
-            "resolution": self.lbl_resolution.text(),
-            "max_step_5cyc": self.lbl_min_step.text(),
-            "recomputed": bool(m.get("recomputed", False)),
-        }
 
     def _write_temporal_hyp_h5(self, stem: str, raw, pos_used, pos_raw,
                                settings, pos_info) -> str:
@@ -1590,14 +1545,17 @@ class MeasurePanel(QWidget):
                                                     correction file is loaded, else
                                                     the raw measured positions
 
-          <stem>_SpectralHypercube.h5   spectral hypercube (spatial axes first)
-              Hyperspectrum_cube  spectrum cube, axes (x=cols, y=rows, freq)
-              fr_real       optical frequency c/lambda (THz)
-              f             stage pseudo-frequency axis (after the FT over t)
-              file_totCal   FULL path of the spectral calibration file
-              /settings     attrs: the Spectrum subpanel settings used
+          <stem>_SpectralHypercube.h5   spectral hypercube (SpectralHypercube layout)
+              /SpectralHypercube/Hyperspectrum_cube  spectra (x, y, freq as MATLAB
+                                                     reads them), float32
+              /SpectralHypercube/fr_real   optical frequency c/lambda (THz), (n,1)
+              /SpectralHypercube/f         stage pseudo-frequency axis, (n,1)
+              /SpectralHypercube/saturationMap  (y, x) 1 = valid, 0 = saturated
+              /file_totCal                 spectral calibration file path (root)
 
-        Returns the list of paths written (empty if there was no data to write)."""
+        The scan/spectrum settings live in the temporal file's
+        /measurement/hyper/settings, so the spectral file matches its reference
+        layout exactly. Returns the list of paths written."""
         from instruments.calibration import spectral_calibration_status
         written = []
 
@@ -1615,8 +1573,17 @@ class MeasurePanel(QWidget):
 
         # File 2: spectral hypercube. Needs the computed spectrum + wavelengths.
         if self.cubes and self.wavelengths is not None and len(self.wavelengths):
-            spec = self._spectrum_for_saving()          # (n_maps, freq, y, x)
-            cube0 = np.asarray(spec[0])                 # (freq, y, x); complex64 if phase kept
+            # "Save complex spectrum" ON -> keep the FT phase, stored the way the
+            # MATLAB codes expect: a REAL float32 stack of the real slices followed
+            # by the imaginary slices along the frequency axis, so the cube has
+            # 2*n_freq slices (f/fr_real still have n_freq). OFF -> float32
+            # magnitude, n_freq slices. Both are (slices, y, x).
+            cx = getattr(self, "complex_cubes", None)
+            if cx and len(cx) == len(self.cubes):
+                c = np.asarray(cx[0], dtype=np.complex64)          # (freq, y, x)
+                cube0 = np.concatenate([c.real, c.imag], axis=0).astype(np.float32)
+            else:
+                cube0 = np.asarray(self.cubes[0], dtype=np.float32)
             wl_um = np.asarray(self.wavelengths, dtype=float)
             fr_real = self._C_UM_THZ / wl_um            # THz
             try:
@@ -1624,45 +1591,31 @@ class MeasurePanel(QWidget):
                     self.est_proc.pseudo_frequencies(wl_um), dtype=float)
             except Exception:  # noqa: BLE001
                 f_axis = 1.0 / wl_um
+            # saturationMap: 1 = valid pixel, 0 = saturated (matches the reference's
+            # all-ones map for a clean scan). One map per run (map index 0).
+            masks = getattr(self, "sat_masks", None) or []
+            h, w = cube0.shape[1], cube0.shape[2]
+            if masks and masks[0] is not None:
+                satmap = (~np.asarray(masks[0], dtype=bool)).astype(np.float64)
+            else:
+                satmap = np.ones((h, w), dtype=np.float64)
             _, spectral_cal_path = spectral_calibration_status()
-            written.append(self._write_hyper_file(stem + "_SpectralHypercube", {
-                "Hyperspectrum_cube": np.ascontiguousarray(
-                    np.transpose(cube0, (2, 1, 0))),
-                "fr_real": fr_real.reshape(-1),
-                "f": f_axis.reshape(-1),
-                "file_totCal": spectral_cal_path or "",
-            }, settings=self._spectrum_settings_summary()))
+            written.append(self._write_spectral_hypercube_h5(
+                stem, cube0, f_axis, fr_real, satmap, spectral_cal_path))
 
         return written
-
-    def _spectrum_for_saving(self):
-        """The cube array to write: complex64 when "Save complex spectrum" was on
-        for this result, else the float32 magnitude in self.cubes."""
-        cx = getattr(self, "complex_cubes", None)
-        if cx and len(cx) == len(self.cubes):
-            # complex64 = float32 real + float32 imag: the phase costs one extra
-            # float32 per element, never float64. Pinned so nothing upcasts.
-            return np.asarray(cx, dtype=np.complex64)
-        return np.asarray(self.cubes, dtype=np.float32)
 
     def _save(self) -> None:
         if not self.cubes:
             self.lbl_status.setText("nothing to save")
             return
-        mode = self.combo_save.currentText()
-        want_cube = mode.startswith("Full cube") or mode == "Both"
-        want_roi = mode.startswith("ROI average") or mode == "Both"
         # Save into the run folder (<run-stamp>.<filename>/) so all of this
         # experiment's files stay together.
         try:
             folder, stamp, fname = self._run_target()
             stem = os.path.join(folder, f"{stamp}.{fname}")
-            saved = []
-            if want_cube:
-                saved.append(os.path.basename(self._save_cube(stem)))
-            if want_roi:
-                saved.append(os.path.basename(self._save_roi_average_csv(stem)))
-            self.lbl_status.setText(f"saved {', '.join(saved)} to {folder}")
+            saved = os.path.basename(self._save_cube(stem))
+            self.lbl_status.setText(f"saved {saved} to {folder}")
         except Exception as e:  # noqa: BLE001
             self.lbl_status.setText(f"save error: {e}")
 
@@ -1705,16 +1658,19 @@ class MeasurePanel(QWidget):
             return None
         try:
             with h5py.File(path, "r") as f:
-                if "Hyperspectrum_cube" not in f or "fr_real" not in f:
+                g = f.get("SpectralHypercube")
+                if g is None or "Hyperspectrum_cube" not in g or "fr_real" not in g:
                     return None
-                cube_xyf = np.asarray(f["Hyperspectrum_cube"])   # (x, y, freq)
-                fr_real = np.asarray(f["fr_real"]).reshape(-1)    # THz
+                cube = np.asarray(g["Hyperspectrum_cube"])       # (slices, y, x)
+                fr_real = np.asarray(g["fr_real"]).reshape(-1)   # THz
         except Exception:  # noqa: BLE001
             return None
-        cube = np.transpose(cube_xyf, (2, 1, 0))                 # (freq, y, x)
-        if np.iscomplexobj(cube):
-            cube = np.abs(cube)                                  # viewer shows magnitude
-        cube = np.ascontiguousarray(cube, dtype=np.float32)
+        n = int(fr_real.size)
+        # Complex was saved as a real stack of 2*n_freq slices (real then imag);
+        # rebuild the magnitude for the viewer. Otherwise it is already magnitude.
+        if cube.shape[0] == 2 * n:
+            cube = np.abs(cube[:n] + 1j * cube[n:])
+        cube = np.ascontiguousarray(cube, dtype=np.float32)      # (n_freq, y, x)
         wl_um = self._C_UM_THZ / fr_real                         # THz -> um
         return wl_um, [cube], [None], [None]
 

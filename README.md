@@ -95,20 +95,30 @@ DelayCorrection layout the pre-existing MATLAB code reads:
                                       loaded (else position_mm already IS the raw axis)
 ```
 
-**`<run-stamp>.<filename>_SpectralHypercube.h5`** — spectral hypercube:
+**`<run-stamp>.<filename>_SpectralHypercube.h5`** — spectral hypercube, in the
+pre-existing MATLAB `SpectralHypercube` layout:
 
 ```
-Hyperspectrum_cube   spectrum cube, axes (x=cols, y=rows, freq); complex64 if phase kept
-fr_real              optical frequency c/λ, in THz
-f                    stage pseudo-frequency axis (after the FT over motor positions)
-file_totCal          full path of the spectral calibration file (parameters_cal.txt)
-/settings            attrs: the Spectrum-subpanel settings used (apod, λ window, N freq, …)
+/SpectralHypercube/Hyperspectrum_cube  spectra, float32, stored (slices, y, x) so
+                                       MATLAB's h5read returns (x, y, slices):
+                                       (n_freq, y, x) for the magnitude, or
+                                       (2*n_freq, y, x) when "Save complex spectrum"
+                                       is on = real slices then imaginary slices
+/SpectralHypercube/fr_real             optical frequency c/λ in THz, (n_freq, 1) float64
+/SpectralHypercube/f                   stage pseudo-frequency axis (after the FT
+                                       over motor positions), (n_freq, 1) float64
+/SpectralHypercube/saturationMap       (y, x) float64; 1 = valid pixel, 0 = saturated
+/file_totCal                           spectral calibration file path (at the ROOT)
 ```
 
 The optical frequency is `fr_real[THz] = 299.792458 / λ[µm]`; the wavelength axis
-is recoverable as `λ = 299.792458 / fr_real`. When "Save complex spectrum" is on,
-`Hyperspectrum_cube` is stored as `complex64` (float32 real + imag) to keep the
-interferometric phase; the viewer always shows `|spectrum|`.
+is recoverable as `λ = 299.792458 / fr_real`. The FT of a real interferogram is
+complex; "Save complex spectrum" chooses whether to keep the phase. When on, the
+cube is a **real float32 stack** — the `n_freq` real slices followed by the
+`n_freq` imaginary slices (so `2*n_freq` slices, while `f`/`fr_real` keep `n_freq`)
+— matching the lab's MATLAB reader; when off it is the float32 `|spectrum|`. The
+scan/spectrum settings are recorded once, in the temporal file's
+`/measurement/hyper/settings`.
 
 ## Layout
 

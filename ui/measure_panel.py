@@ -130,15 +130,9 @@ class HyperViewer(QWidget):
 
         ctl = QHBoxLayout()
         self.combo_map = QComboBox()
-        self.combo_map.addItems(["λ scrub", "Peak λ", "Peak intensity",
-                                 "SAM (selected px)", "Continuum line"])
+        self.combo_map.addItems(["λ scrub", "Peak λ", "Peak intensity"])
         self.combo_map.setToolTip("λ scrub: spatial map at each wavelength.\n"
-                                  "Peak λ/intensity: per-pixel spectral peak.\n"
-                                  "SAM: spectral-angle distance to the selected pixel.\n"
-                                  "Continuum line: per-pixel line emission with the\n"
-                                  "  broadband (thermal) continuum subtracted -- a linear\n"
-                                  "  baseline from two shoulder bands is removed under the\n"
-                                  "  line band (see CONTINUUM_SUBTRACTION.md).")
+                                  "Peak λ/intensity: per-pixel spectral peak.")
         self.combo_map.currentTextChanged.connect(self._refresh_map)
         ctl.addWidget(QLabel("Map:")); ctl.addWidget(self.combo_map, 1)
         self.combo_deriv = QComboBox()

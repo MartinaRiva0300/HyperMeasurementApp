@@ -76,13 +76,23 @@ HDF5 is the only format (it needs `h5py`; saving reports a clear error without
 it). The ROI-average CSV is unaffected. The Measure tab's Load button reads the
 spectral file back for viewing.
 
-**`<run-stamp>.<filename>_hyp.h5`** — temporal hypercube:
+**`<run-stamp>.<filename>_hyp.h5`** — temporal hypercube, in the `HyperMatrix` /
+DelayCorrection layout the pre-existing MATLAB code reads:
 
 ```
-HyperMatrix     interferogram cube, axes (x=cols, y=rows, time=motor steps)
-t               raw (non-corrected) motor positions
-t_corr          motor-nonlinearity-corrected positions
-file_tot_del    full path of the motor-position calibration file (parameters_int.txt)
+/measurement/hyper/settings        this app's measurement settings (attrs)
+/measurement/hyper/t0/c0/image        interferogram cube, stored (n_pos, y, x) so
+                                      MATLAB's h5read returns (x, y, motor position);
+                                      attr element_size_um = [z, y, x]
+/measurement/hyper/t0/c0/position_mm  the wedge axis actually used: the motor-
+                                      corrected positions when the correction file
+                                      (parameters_int.txt) is loaded, else the raw
+                                      measured positions. Stored in MICROMETRES
+                                      (name kept; units attr = "um"); attrs axis,
+                                      calibration_file
+/measurement/hyper/t0/c0/position_mm_raw  the raw non-corrected positions (µm),
+                                      written ONLY when the correction file is
+                                      loaded (else position_mm already IS the raw axis)
 ```
 
 **`<run-stamp>.<filename>_SpectralHypercube.h5`** — spectral hypercube:

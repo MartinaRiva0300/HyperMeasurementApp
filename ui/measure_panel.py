@@ -1523,17 +1523,74 @@ class MeasurePanel(QWidget):
             "recomputed": bool(m.get("recomputed", False)),
         }
 
+    def _write_temporal_hyp_h5(self, stem: str, raw, pos_used, pos_raw,
+                               settings, pos_info) -> str:
+        """Write the temporal hypercube in the app's `HyperMatrix`/DelayCorrection
+        layout, read by the pre-existing MATLAB code at ``/measurement/hyper/t0/c0/``:
+
+            /measurement/hyper/settings   attrs: this app's measurement settings
+            /measurement/hyper/t0/c0/image        (n_pos, y, x) the interferograms
+                                                  -> MATLAB reads (x, y, motor pos)
+                                   attrs: element_size_um = [z, y, x]
+            /measurement/hyper/t0/c0/position_mm  (n_pos,) the wedge axis actually
+                                   used: the motor-corrected positions when the
+                                   correction file is loaded, else the raw measured
+                                   positions. attrs: units, axis, calibration_file
+            /measurement/hyper/t0/c0/position_mm_raw  (n_pos,) the raw non-corrected
+                                   positions -- written ONLY when the correction file
+                                   is loaded (otherwise position_mm already holds
+                                   the raw positions and this is omitted).
+
+        Positions are stored in MICROMETRES (the `position_mm` name is kept for the
+        reader; a `units` attr records "um"). HDF5 is C-order, so storing the cube
+        as (n_pos, y, x) makes MATLAB's `h5read` (which reverses the dimension
+        order) return (x, y, n_pos)."""
+        try:
+            import h5py
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "h5py is required to save (HDF5 is the only save format). "
+                "Install it with: pip install h5py") from e
+        from instruments.h5_writer import _set_attrs
+        applied = bool(pos_info.get("motor_calibration_applied", False))
+        to_um = 1000.0                               # app works in mm; save µm
+        path = stem + "_hyp.h5"
+        with h5py.File(path, "w") as f:
+            hyper = f.create_group("measurement/hyper")
+            _set_attrs(hyper.create_group("settings"), settings)
+            c0 = hyper.create_group("t0/c0")
+            img = c0.create_dataset("image", data=np.ascontiguousarray(raw))  # (n_pos, y, x)
+            img.attrs["element_size_um"] = np.array([1.0, 1.0, 1.0], dtype=float)
+            pm = c0.create_dataset(
+                "position_mm",
+                data=np.asarray(np.asarray(pos_used) * to_um, dtype=np.float32))
+            pm.attrs["units"] = "um"
+            pm.attrs["axis"] = pos_info.get("position_axis_used", "raw_measured")
+            if pos_info.get("motor_calibration_file"):
+                pm.attrs["calibration_file"] = pos_info["motor_calibration_file"]
+            # Only keep the raw axis separately when position_mm holds the CORRECTED
+            # one; without a correction file position_mm is already the raw axis.
+            if applied:
+                pmr = c0.create_dataset(
+                    "position_mm_raw",
+                    data=np.asarray(np.asarray(pos_raw) * to_um, dtype=np.float32))
+                pmr.attrs["units"] = "um"
+                pmr.attrs["axis"] = "raw_measured"
+        return path
+
     def _save_matlab_files(self, stem: str):
         """Write the two files the lab's pre-existing codes expect, as HDF5. Uses
-        the first (single) wedge cube. Spatial axes come first in every cube.
+        the first (single) wedge cube.
 
-          <stem>_hyp.h5              temporal hypercube
-              HyperMatrix   interferogram cube, axes (x=cols, y=rows, time=steps)
-              t             raw (non-corrected) motor positions
-              t_corr        motor-nonlinearity-corrected positions
-              file_tot_del  FULL path of the motor-position calibration file
+          <stem>_hyp.h5              temporal hypercube (DelayCorrection layout)
+              /measurement/hyper/settings        this app's measurement settings
+              /measurement/hyper/t0/c0/image        interferograms (x, y, motor pos
+                                                    as MATLAB reads them)
+              /measurement/hyper/t0/c0/position_mm  corrected positions if the motor
+                                                    correction file is loaded, else
+                                                    the raw measured positions
 
-          <stem>_SpectralHypercube.h5   spectral hypercube
+          <stem>_SpectralHypercube.h5   spectral hypercube (spatial axes first)
               Hyperspectrum_cube  spectrum cube, axes (x=cols, y=rows, freq)
               fr_real       optical frequency c/lambda (THz)
               f             stage pseudo-frequency axis (after the FT over t)
@@ -1541,24 +1598,20 @@ class MeasurePanel(QWidget):
               /settings     attrs: the Spectrum subpanel settings used
 
         Returns the list of paths written (empty if there was no data to write)."""
-        from instruments.calibration import (position_calibration_status,
-                                             spectral_calibration_status)
+        from instruments.calibration import spectral_calibration_status
         written = []
 
         # File 1: temporal hypercube (interferograms). Needs the raw cube.
         raw_cubes = getattr(self, "raw_cubes", None) or []
         raw_positions = getattr(self, "raw_positions", None) or []
         if raw_cubes and raw_positions:
-            raw = np.asarray(raw_cubes[0])              # (time, y, x)
+            raw = np.asarray(raw_cubes[0])              # (n_pos, y, x) -- stored as-is
             pos = np.asarray(raw_positions[0], dtype=float).reshape(-1)
-            t_corr, _ = self._position_calibration(pos)
-            _, motor_cal_path = position_calibration_status()
-            written.append(self._write_hyper_file(stem + "_hyp", {
-                "HyperMatrix": np.ascontiguousarray(np.transpose(raw, (2, 1, 0))),
-                "t": pos,
-                "t_corr": np.asarray(t_corr, dtype=float).reshape(-1),
-                "file_tot_del": motor_cal_path or "",
-            }))
+            # The axis the DFT actually used: motor-corrected when the correction
+            # file is loaded, else the raw measured positions.
+            pos_used, pos_info = self._position_calibration(pos)
+            written.append(self._write_temporal_hyp_h5(
+                stem, raw, pos_used, pos, self._build_metadata(), pos_info))
 
         # File 2: spectral hypercube. Needs the computed spectrum + wavelengths.
         if self.cubes and self.wavelengths is not None and len(self.wavelengths):

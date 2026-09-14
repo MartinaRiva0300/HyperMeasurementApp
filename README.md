@@ -258,6 +258,16 @@ turns it **red** when the chosen step under-samples the shortest wavelength.
   **Binning and decimation cannot be active simultaneously.**
 - Spinnaker has no on-camera frame averaging, so the **Averaging** control
   averages N frames in software; the effective rate drops by N.
+  - **Gain** controls the amplification applied to the pixel signal during
+  analog-to-digital conversion. Increasing gain produces a brighter image but
+  also increases noise. For reproducible quantitative measurements, use manual
+  gain by setting `GainAuto` to `Off` and keep the gain fixed between
+  acquisitions. The `Gain` control sets the amplification in dB.
+- **Black Level** controls the offset applied to the video signal and determines
+  the image baseline in the absence of illumination. The total black level
+  includes both analog and digital contributions. For reproducible
+  measurements, keep the black level fixed between acquisitions; the user
+  controls the total offset through the `All` Black Level selector.
 Details available at this page: [FG-PGE-13S3S-U Technical Reference](https://www.teledynevisionsolutions.com/en-hk/products/forge-1gige-swir/?model=FG-PGE-13S3S-U-C&vertical=machine%20vision&segment=iis)
 
 ### Stage

@@ -49,7 +49,6 @@ def publish_status(frame_queue: mp.Queue, status: CameraStatus) -> None:
             "frame_counter": status.frame_counter,
             "raw_peak_count": status.raw_peak_count,
             "board_temp_c": status.board_temp_c,
-            "fpa_temp_k": status.fpa_temp_k,
         },
     })
 

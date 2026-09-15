@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
         # right-aligned. Updates every 5 min, or on demand via the Poll button.
         temp_row = QHBoxLayout()
         temp_row.addStretch()
-        self.temp_value_label = QLabel("FPGA/Board: -- °C   FPA: -- K")
+        self.temp_value_label = QLabel("FPGA/Board: -- °C")
         self.temp_value_label.setStyleSheet("font-weight: 600; font-size: 13px;")
         temp_row.addWidget(self.temp_value_label)
         self.btn_poll_temp = QPushButton("Poll")
@@ -1005,7 +1005,6 @@ class MainWindow(QMainWindow):
             "roi_height": s.get("height"),
             "hardware_roi": bool(self._hw_roi_active),
             "board_temp_c": s.get("board_temp_c"),
-            "fpa_temp_k": s.get("fpa_temp_k"),
             "save_filename_camera": self.save_filename,
         }
 
@@ -1043,12 +1042,10 @@ class MainWindow(QMainWindow):
         self._apply_binning_options(status.get("binning_options"),
                                     int(status.get("binning", 1) or 1))
 
-        # Temperatures (board/FPGA in °C, FPA in K). NaN -> "--".
+        # Board/FPGA temperature (°C). NaN -> "--".
         board = float(status.get("board_temp_c", float("nan")))
-        fpa = float(status.get("fpa_temp_k", float("nan")))
         b_txt = f"{board:.1f} °C" if board == board else "-- °C"
-        f_txt = f"{fpa:.1f} K" if fpa == fpa else "-- K"
-        self.temp_value_label.setText(f"FPGA/Board: {b_txt}   FPA: {f_txt}")
+        self.temp_value_label.setText(f"FPGA/Board: {b_txt}")
 
         state = "connected" if status.get("connected") else "offline"
         acquisition = "acquiring" if status.get("acquiring") else "idle"

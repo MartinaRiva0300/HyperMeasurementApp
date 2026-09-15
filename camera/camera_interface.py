@@ -25,7 +25,6 @@ class CameraStatus:
     frame_counter: int = 0
     raw_peak_count: float = 0.0
     board_temp_c: float = float("nan")   # FPGA/electronics board temperature (°C)
-    fpa_temp_k: float = float("nan")     # focal-plane array temperature (K)
     exposure_min_ms: float = 0.001       # sensor's shortest exposure (from hardware)
     exposure_max_ms: float = 1000.0      # sensor's longest exposure (from hardware)
     binning: int = 1                     # on-sensor (hardware) NxN binning factor

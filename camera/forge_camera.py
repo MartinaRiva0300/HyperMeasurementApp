@@ -560,10 +560,7 @@ class ForgeSwirCamera(CameraInterface):
             logger.warning(self.status.message)
 
     def refresh_temperatures(self) -> None:
-        """Read the camera's internal temperature into status.board_temp_c.
-
-        The Forge SWIR has no separate cooled-FPA readout, so fpa_temp_k stays
-        NaN (the UI hides it)."""
+        """Read the camera's internal temperature into status.board_temp_c."""
         if self._cam is None:
             return
         PySpin = self._spin

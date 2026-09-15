@@ -195,11 +195,17 @@ class HyperspectralProcessor:
         """Nyquist (2 samples/cycle) stage step at the shortest wavelength."""
         return self.max_step_um(wl_short_um, samples_per_cycle=2)
 
-    def estimate_resolution_nm(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
-        """Spectral resolution (FWHM, nm) from the stage scan range, using the
-        calibration's local slope (accounts for TWINS birefringence). The stage
-        pseudo-frequency FWHM is the apodization-broadened FWHM (FFT of the
-        window) for the chosen FTIR window."""
+    def estimate_resolution(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
+        """Spectral resolution from the stage scan range, as ``(value, unit)``.
+
+        The scan sets the pseudo-frequency FWHM ``δk`` (the apodization-broadened
+        FWHM of the chosen FTIR window, or ``1/scan_range`` as a fallback):
+          - no calibration  -> ``(δk, "1/mm")`` -- the pseudo-frequency resolution
+            itself, since there is nothing to convert it with;
+          - calibration (optical frequency in THz vs pseudo-frequency k) ->
+            ``(|dν/dk|·δk, "THz")`` -- the optical-frequency resolution at the band
+            centre, by the chain rule.
+        Returns None if the inputs are invalid."""
         if not scan_range_mm or scan_range_mm <= 0:
             return None
         if not wl_center_um or wl_center_um <= 0:
@@ -213,18 +219,20 @@ class HyperspectralProcessor:
         except Exception:  # noqa: BLE001
             pass
         if self.wavelength_cal is None or self.reciprocal_cal is None:
-            return (wl_center_um ** 2) * delta_recip * 1000.0
+            return (delta_recip, "1/mm")            # reciprocal (pseudo-frequency) units
         try:
             from scipy.interpolate import interp1d
-            fn = interp1d(1.0 / self.wavelength_cal, self.reciprocal_cal,
-                          kind="linear", fill_value="extrapolate")
-            inv_lambda_c = 1.0 / wl_center_um
-            eps = max(inv_lambda_c * 1e-3, 1e-6)
-            slope = float((fn(inv_lambda_c + eps) - fn(inv_lambda_c - eps)) / (2 * eps))
-            if slope == 0:
-                return None
-            delta_inv_lambda = abs(delta_recip / slope)
-            return (wl_center_um ** 2) * delta_inv_lambda * 1000.0
+            # Calibration as the physics uses it: optical frequency ν (THz) as a
+            # function of the stage pseudo-frequency k (reciprocal units).
+            fr_cal = 299.792458 / self.wavelength_cal          # THz  (c / λ)
+            k_of_wl = interp1d(self.wavelength_cal, self.reciprocal_cal,
+                               kind="linear", fill_value="extrapolate")
+            fr_of_k = interp1d(self.reciprocal_cal, fr_cal,
+                               kind="linear", fill_value="extrapolate")
+            k_c = float(k_of_wl(wl_center_um))
+            eps = max(abs(k_c) * 1e-3, 1e-6)
+            dnu_dk = float((fr_of_k(k_c + eps) - fr_of_k(k_c - eps)) / (2 * eps))
+            return (abs(dnu_dk) * delta_recip, "THz")          # optical-frequency resolution
         except Exception:  # noqa: BLE001
             return None
 

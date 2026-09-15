@@ -662,7 +662,7 @@ class MeasurePanel(QWidget):
         # Calibration-aware estimates: spectral resolution from scan range +
         # apodization window, and the max stage step that still samples the
         # shortest λ at 5 pts/cycle.
-        self.lbl_resolution = QLabel("-- nm"); self.lbl_resolution.setStyleSheet("font-weight:600;")
+        self.lbl_resolution = QLabel("--"); self.lbl_resolution.setStyleSheet("font-weight:600;")
         self.lbl_min_step = QLabel("-- µm"); self.lbl_min_step.setStyleSheet("font-weight:600;")
         grid.addWidget(QLabel("Resolution"), 6, 0); grid.addWidget(self.lbl_resolution, 6, 1)
         grid.addWidget(QLabel("Max step (5/cyc)"), 7, 0); grid.addWidget(self.lbl_min_step, 7, 1)
@@ -953,10 +953,13 @@ class MeasurePanel(QWidget):
             wl0, wl1 = self.spin_wl0.value(), self.spin_wl1.value()
             wl_center = 0.5 * (wl0 + wl1)
             apod_type = self.combo_apod.currentText()
-            res_nm = self.est_proc.estimate_resolution_nm(
+            res = self.est_proc.estimate_resolution(
                 abs(stop - start), wl_center, apod_type=apod_type)
-            self.lbl_resolution.setText(
-                "-- nm" if res_nm is None else f"~{res_nm:.0f} nm @ {wl_center:.1f} µm")
+            if res is None:
+                self.lbl_resolution.setText("--")
+            else:
+                value, unit = res
+                self.lbl_resolution.setText(f"~{value:.3g} {unit} @ {wl_center:.1f} µm")
 
             wl_short = min(wl0, wl1)
             max_um = self.est_proc.max_step_um(wl_short, samples_per_cycle=5)

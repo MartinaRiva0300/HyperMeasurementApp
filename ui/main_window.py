@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         self._display_levels = (0.0, 16383.0)
         self.profile_pixel = None  # (row, col) for X/Y profiles; None = center
         self.save_dir = r"C:\temp"
+        self._hw_roi_active = False   # camera cropped to a hardware ROI
         self.save_filename = "filename"
         self.auto_scale_display = False
         self.frame_count = 0
@@ -137,7 +138,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([360, 1000])
 
-        title = QLabel("Beam Viewer")
+        title = QLabel("Camera Viewer")
         title.setStyleSheet("font-size: 20px; font-weight: 600;")
         viewer_column.addWidget(title)
 
@@ -151,9 +152,20 @@ class MainWindow(QMainWindow):
         roi_row = QHBoxLayout()
         self.roi_checkbox = QCheckBox("Show measurement ROI (drag the box on the image)")
         self.roi_checkbox.toggled.connect(self.set_roi_visible)
+        self.btn_apply_roi = QPushButton("Apply ROI to camera")
+        self.btn_apply_roi.setToolTip(
+            "Crop the camera readout to the box (Width/Height/OffsetX/OffsetY) so "
+            "only the ROI is captured and transmitted — faster scans. The live "
+            "view then shows only the ROI; use 'Full frame' to widen it again.")
+        self.btn_apply_roi.clicked.connect(self.on_apply_roi)
+        self.btn_full_frame = QPushButton("Full frame")
+        self.btn_full_frame.setToolTip("Restore full-frame camera readout.")
+        self.btn_full_frame.clicked.connect(self.on_full_frame)
         self.roi_bounds_label = QLabel("ROI: full frame")
         self.roi_bounds_label.setStyleSheet("color:#888;")
         roi_row.addWidget(self.roi_checkbox)
+        roi_row.addWidget(self.btn_apply_roi)
+        roi_row.addWidget(self.btn_full_frame)
         roi_row.addWidget(self.roi_bounds_label)
         roi_row.addStretch()
         viewer_column.addLayout(roi_row)
@@ -315,7 +327,6 @@ class MainWindow(QMainWindow):
         self.opt_combos = {}
         for label, node, options in (
             ("Auto exposure", "ExposureAuto", ["Off", "Once", "Continuous"]),
-            ("Auto gain", "GainAuto", ["Off", "Once", "Continuous"]),
             ("Pixel format", "PixelFormat", ["Mono16", "Mono12p", "Mono8"]),
             ("ADC bit depth", "AdcBitDepth", ["Bit12", "Bit10", "Bit8"]),
         ):
@@ -329,6 +340,58 @@ class MainWindow(QMainWindow):
             row.addWidget(cb)
             layout.addLayout(row)
             self.opt_combos[node] = cb
+
+        # Gain: manual only (no auto). Either OFF (minimum gain) or ON at the dB
+        # level set here; GainAuto is forced Off so Gain is writable.
+        gain_row = QHBoxLayout()
+        self.gain_check = QCheckBox("Gain")
+        self.gain_check.setToolTip(
+            "Manual sensor gain (no auto). Unchecked = minimum gain (off); "
+            "checked = the dB level set here. GainAuto is always Off.")
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setRange(0.0, 48.0)
+        self.gain_spin.setDecimals(2)
+        self.gain_spin.setSingleStep(0.5)
+        self.gain_spin.setSuffix(" dB")
+        self.gain_spin.setValue(0.0)
+        self.gain_spin.setEnabled(False)      # editable only when gain is on
+        self.gain_check.toggled.connect(self.on_gain_toggled)
+        self.gain_spin.valueChanged.connect(self.on_gain_value_changed)
+        gain_row.addWidget(self.gain_check)
+        gain_row.addWidget(self.gain_spin)
+        layout.addLayout(gain_row)
+
+        # Image orientation: the camera's own mirror flags (ReverseX/ReverseY).
+        rev_row = QHBoxLayout()
+        rev_row.addWidget(QLabel("Flip"))
+        self.reverse_x_check = QCheckBox("Reverse X")
+        self.reverse_x_check.setToolTip("Mirror the image horizontally (camera ReverseX).")
+        self.reverse_x_check.toggled.connect(
+            lambda v: self.control_queue.put(
+                {"type": "set_option", "name": "ReverseX", "value": bool(v)}))
+        self.reverse_y_check = QCheckBox("Reverse Y")
+        self.reverse_y_check.setToolTip("Mirror the image vertically (camera ReverseY).")
+        self.reverse_y_check.toggled.connect(
+            lambda v: self.control_queue.put(
+                {"type": "set_option", "name": "ReverseY", "value": bool(v)}))
+        rev_row.addWidget(self.reverse_x_check)
+        rev_row.addWidget(self.reverse_y_check)
+        rev_row.addStretch()
+        layout.addLayout(rev_row)
+
+        bin_row = QHBoxLayout()
+        bin_row.addWidget(QLabel("Software binning"))
+        self.binning_combo = QComboBox()
+        # NxN binning; H and V are kept equal. The choices are populated from what
+        # the camera reports it supports (see _apply_status).
+        self.binning_combo.addItem("1")
+        self.binning_combo.setToolTip(
+            "Binning, N×N. Sets BinningSelector=All and "
+            "BinningHorizontal=BinningVertical=N. Reduces resolution, raises "
+            "sensitivity and frame rate. The choices are what the camera supports.")
+        self.binning_combo.currentTextChanged.connect(self.on_binning_changed)
+        bin_row.addWidget(self.binning_combo)
+        layout.addLayout(bin_row)
 
         fr_row = QHBoxLayout()
         fr_row.addWidget(QLabel("Frame rate (Hz)"))
@@ -545,6 +608,65 @@ class MainWindow(QMainWindow):
     def _slider_to_ms(self, s: int) -> float:
         return float(self.INT_MIN_MS * (self.INT_MAX_MS / self.INT_MIN_MS) ** (s / 1000.0))
 
+    def _apply_exposure_limits(self, lo_ms, hi_ms) -> None:
+        """Adopt the camera's hardware exposure range for the slider/spin. No-op
+        unless it actually changed (avoids reformatting the widgets every frame)."""
+        try:
+            lo = float(lo_ms)
+            hi = float(hi_ms)
+        except (TypeError, ValueError):
+            return
+        if not (lo > 0 and hi > lo):
+            return
+        if abs(lo - self.INT_MIN_MS) < 1e-9 and abs(hi - self.INT_MAX_MS) < 1e-9:
+            return
+        self.INT_MIN_MS, self.INT_MAX_MS = lo, hi
+        self.integration_spin.blockSignals(True)
+        self.integration_spin.setRange(lo, hi)
+        self.integration_spin.blockSignals(False)
+
+    def _apply_binning_options(self, options, current) -> None:
+        """Fill the binning drop-down with the camera's supported factors and
+        select the applied one. Rebuilds the item list only when it changes, and
+        never emits a set_binning while syncing."""
+        try:
+            opts = sorted({int(o) for o in (options or [])})
+        except (TypeError, ValueError):
+            opts = []
+        if not opts:
+            opts = [1]
+        labels = [str(o) for o in opts]
+        existing = [self.binning_combo.itemText(i)
+                    for i in range(self.binning_combo.count())]
+        self.binning_combo.blockSignals(True)
+        if labels != existing:
+            self.binning_combo.clear()
+            self.binning_combo.addItems(labels)
+        target = str(int(current))
+        if target in labels and self.binning_combo.currentText() != target:
+            self.binning_combo.setCurrentText(target)
+        self.binning_combo.blockSignals(False)
+
+    def on_gain_toggled(self, checked: bool) -> None:
+        self.gain_spin.setEnabled(checked)
+        # GainAuto stays Off either way; ON applies the dB level, OFF drops to the
+        # camera's minimum gain (Gain=0 is clamped up to the node's min).
+        self.control_queue.put({"type": "set_option", "name": "GainAuto", "value": "Off"})
+        value = float(self.gain_spin.value()) if checked else 0.0
+        self.control_queue.put({"type": "set_option", "name": "Gain", "value": value})
+
+    def on_gain_value_changed(self, value: float) -> None:
+        if self.gain_check.isChecked():
+            self.control_queue.put(
+                {"type": "set_option", "name": "Gain", "value": float(value)})
+
+    def on_binning_changed(self, text: str) -> None:
+        try:
+            n = int(text)
+        except (TypeError, ValueError):
+            return
+        self.control_queue.put({"type": "set_binning", "value": n})
+
     def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
         integration_ms = float(np.clip(integration_ms, self.INT_MIN_MS, self.INT_MAX_MS))
         self.integration_label.setText(f"Integration time: {integration_ms:.3f} ms")
@@ -662,7 +784,11 @@ class MainWindow(QMainWindow):
         self._update_roi_label()
 
     def _update_roi_label(self) -> None:
-        roi = self.get_roi_bounds()
+        if self._hw_roi_active:
+            self.roi_bounds_label.setText(
+                "ROI: applied to camera — press 'Full frame' to reset")
+            return
+        roi = self._roi_box_bounds()
         if roi is None:
             self.roi_bounds_label.setText("ROI: full frame")
         else:
@@ -670,9 +796,41 @@ class MainWindow(QMainWindow):
             self.roi_bounds_label.setText(
                 f"ROI: rows {r0}-{r1}, cols {c0}-{c1}  ({r1-r0}×{c1-c0} px)")
 
+    def on_apply_roi(self) -> None:
+        """Push the drawn box to the camera as a hardware ROI (crop readout)."""
+        bounds = self._roi_box_bounds()
+        if bounds is None:
+            self.status_label.setText(
+                "Draw the ROI box first (tick 'Show measurement ROI'), then Apply.")
+            return
+        r0, r1, c0, c1 = bounds
+        self.control_queue.put({"type": "set_roi", "row0": r0, "row1": r1,
+                                "col0": c0, "col1": c1})
+        self._hw_roi_active = True
+        # Geometry changed: an old full-frame background no longer matches.
+        self.background_frame = None
+        # The box is meaningless on the cropped view; hide it until Full frame.
+        self.roi_checkbox.setChecked(False)
+        self._update_roi_label()
+
+    def on_full_frame(self) -> None:
+        """Restore full-frame readout on the camera."""
+        self.control_queue.put({"type": "reset_roi"})
+        self._hw_roi_active = False
+        self.background_frame = None
+        self._update_roi_label()
+
     def get_roi_bounds(self):
-        """Current ROI as (row0, row1, col0, col1) clamped to the frame, or None
-        when the ROI box is hidden / there is no frame yet (-> full-frame mean)."""
+        """ROI for SOFTWARE processing. None once a hardware ROI is active -- the
+        streamed frame is already the ROI, so the measure/scan path must not crop
+        again -- otherwise the drawn box (or None when hidden)."""
+        if self._hw_roi_active:
+            return None
+        return self._roi_box_bounds()
+
+    def _roi_box_bounds(self):
+        """The drawn ROI box as (row0, row1, col0, col1) clamped to the current
+        frame, or None when the box is hidden / there is no frame yet."""
         if self.latest_frame is None or not self.roi.isVisible():
             return None
         try:
@@ -820,18 +978,34 @@ class MainWindow(QMainWindow):
             if len(frame_shape) == 2 and frame_shape[0] > 0 and frame_shape[1] > 0:
                 frame = self.shared_frame[: frame_shape[0], : frame_shape[1]].copy()
         if frame is not None:
-            self._apply_frame(frame, latest_frame_packet["measurement"])
+            self._apply_frame(frame)
 
     def _measurement_metadata(self) -> dict:
         """Camera state embedded into the saved Measurement hypercube metadata."""
         s = self.latest_status or {}
         return {
             "camera_serial": s.get("serial_number"),
-            "exposure_ms": s.get("exposure_ms"),
-            "averaging": s.get("average_count"),
-            "fpa_temp_k": s.get("fpa_temp_k"),
-            "board_temp_c": s.get("board_temp_c"),
             "backend": s.get("backend"),
+            "exposure_ms": s.get("exposure_ms"),
+            "exposure_auto": s.get("exposure_auto"),
+            "averaging": s.get("average_count"),
+            "gain_db": s.get("gain_db"),
+            "gain_auto": s.get("gain_auto"),
+            "binning": s.get("binning"),
+            "pixel_format": s.get("pixel_format"),
+            "adc_bit_depth": s.get("adc_bit_depth"),
+            "frame_rate_hz": s.get("frame_rate_hz"),
+            "reverse_x": s.get("reverse_x"),
+            "reverse_y": s.get("reverse_y"),
+            # Absolute ROI on the sensor (camera units, referred to the binned
+            # image) + the streamed frame size.
+            "roi_offset_x": s.get("offset_x"),
+            "roi_offset_y": s.get("offset_y"),
+            "roi_width": s.get("width"),
+            "roi_height": s.get("height"),
+            "hardware_roi": bool(self._hw_roi_active),
+            "board_temp_c": s.get("board_temp_c"),
+            "fpa_temp_k": s.get("fpa_temp_k"),
             "save_filename_camera": self.save_filename,
         }
 
@@ -858,7 +1032,16 @@ class MainWindow(QMainWindow):
             self.average_spin.blockSignals(True)
             self.average_spin.setValue(average_count)
             self.average_spin.blockSignals(False)
+        # Adopt the camera's real exposure range (read from hardware) so the
+        # slider/spin span exactly what the sensor supports.
+        self._apply_exposure_limits(status.get("exposure_min_ms"),
+                                    status.get("exposure_max_ms"))
         self._set_integration_value(exposure_ms, emit=False)
+
+        # Populate the drop-down with the factors the camera supports and select
+        # the one actually applied -- without re-triggering a set_binning command.
+        self._apply_binning_options(status.get("binning_options"),
+                                    int(status.get("binning", 1) or 1))
 
         # Temperatures (board/FPGA in °C, FPA in K). NaN -> "--".
         board = float(status.get("board_temp_c", float("nan")))
@@ -871,7 +1054,7 @@ class MainWindow(QMainWindow):
         acquisition = "acquiring" if status.get("acquiring") else "idle"
         self.status_label.setText(f"Camera is {state}, {acquisition}. {status.get('message', '')}")
 
-    def _apply_frame(self, frame: np.ndarray, measurement: dict) -> None:
+    def _apply_frame(self, frame: np.ndarray) -> None:
         self.latest_frame = frame
 
         # Background capture: average N incoming frames into background_frame.

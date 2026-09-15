@@ -1478,6 +1478,20 @@ class MeasurePanel(QWidget):
                              data=np.array([s], dtype="S%d" % max(len(s), 1)))
         return path
 
+    def _write_settings_group(self, group, meta: dict) -> None:
+        """Write `meta` into an HDF5 group so EVERY setting is an explicit,
+        browsable attribute -- nested dicts (e.g. the camera settings) become
+        sub-groups rather than a JSON blob, so a plain HDF5 reader can navigate
+        them. Scalars/lists become attributes on the group."""
+        from instruments.h5_writer import _set_attrs
+        flat = {}
+        for key, value in (meta or {}).items():
+            if isinstance(value, dict):
+                self._write_settings_group(group.create_group(str(key)), value)
+            else:
+                flat[key] = value
+        _set_attrs(group, flat)
+
     def _write_temporal_hyp_h5(self, stem: str, raw, pos_used, pos_raw,
                                settings, pos_info) -> str:
         """Write the temporal hypercube in the app's `HyperMatrix`/DelayCorrection
@@ -1506,13 +1520,12 @@ class MeasurePanel(QWidget):
             raise RuntimeError(
                 "h5py is required to save (HDF5 is the only save format). "
                 "Install it with: pip install h5py") from e
-        from instruments.h5_writer import _set_attrs
         applied = bool(pos_info.get("motor_calibration_applied", False))
         to_um = 1000.0                               # app works in mm; save µm
         path = stem + "_hyp.h5"
         with h5py.File(path, "w") as f:
             hyper = f.create_group("measurement/hyper")
-            _set_attrs(hyper.create_group("settings"), settings)
+            self._write_settings_group(hyper.create_group("settings"), settings)
             c0 = hyper.create_group("t0/c0")
             img = c0.create_dataset("image", data=np.ascontiguousarray(raw))  # (n_pos, y, x)
             img.attrs["element_size_um"] = np.array([1.0, 1.0, 1.0], dtype=float)

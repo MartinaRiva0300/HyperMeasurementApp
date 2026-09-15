@@ -17,6 +17,8 @@ class MockCamera(CameraInterface):
         self.acquiring = False
         self.frame_index = 0
         self.average_count = 1
+        self._binning = 1
+        self._roi = None           # (r0, r1, c0, c1) in displayed-frame coords, or None
         self.status = CameraStatus(
             connected=False,
             acquiring=False,
@@ -32,6 +34,8 @@ class MockCamera(CameraInterface):
             job_file_path="",
             average_count=1,
             exposure_ms=10.0,
+            binning=1,
+            binning_options=(1, 2, 4, 8),
         )
 
         x = np.linspace(-1.0, 1.0, width, dtype=np.float32)
@@ -71,6 +75,49 @@ class MockCamera(CameraInterface):
         self.status.average_count = self.average_count
         self.status.message = f"Mock averaging set to {self.average_count}"
 
+    def _recompute_geometry(self) -> None:
+        """Reported width/height. The ROI is stored in BINNED-image coordinates,
+        so its size is already the output size; a full frame is the binned full."""
+        if self._roi is None:
+            self.status.width = max(1, self.width // self._binning)
+            self.status.height = max(1, self.height // self._binning)
+        else:
+            r0, r1, c0, c1 = self._roi
+            self.status.width = max(1, c1 - c0)
+            self.status.height = max(1, r1 - r0)
+
+    def set_binning(self, binning: int) -> None:
+        """Simulate on-sensor NxN binning: the output frame shrinks by N and the
+        reported geometry follows (mirrors the real hardware path)."""
+        self._binning = max(1, min(8, int(binning)))
+        self.status.binning = self._binning
+        self._recompute_geometry()
+        self.status.message = (
+            f"Mock binning {self._binning}x{self._binning} "
+            f"-> {self.status.width}x{self.status.height}")
+
+    def set_roi(self, row0: int, row1: int, col0: int, col1: int) -> None:
+        # Coordinates are referred to the current (binned) image.
+        hb = max(1, self.height // self._binning)
+        wb = max(1, self.width // self._binning)
+        r0, r1 = max(0, int(row0)), min(hb, int(row1))
+        c0, c1 = max(0, int(col0)), min(wb, int(col1))
+        if r1 <= r0 or c1 <= c0:
+            return
+        self._roi = (r0, r1, c0, c1)
+        # Offsets in BINNED units (no software flip: straight through), mirroring the Forge.
+        self.status.offset_x = c0
+        self.status.offset_y = r0
+        self._recompute_geometry()
+        self.status.message = f"Mock ROI {self.status.width}x{self.status.height}"
+
+    def reset_roi(self) -> None:
+        self._roi = None
+        self.status.offset_x = 0
+        self.status.offset_y = 0
+        self._recompute_geometry()
+        self.status.message = "Mock ROI full frame"
+
     def get_status(self) -> CameraStatus:
         return copy_camera_status(self.status)
 
@@ -105,4 +152,17 @@ class MockCamera(CameraInterface):
         noise = np.random.normal(20.0, 8.0, size=(self.height, self.width))
 
         frame = beam + secondary + ripple + noise
+
+        # Binning first (charge-summing NxN blocks) -> binned full frame.
+        n = self._binning
+        if n > 1:
+            fh, fw = frame.shape
+            h = (fh // n) * n
+            w = (fw // n) * n
+            frame = frame[:h, :w].reshape(h // n, n, w // n, n).sum(axis=(1, 3))
+
+        # Then the ROI, in BINNED-image coords (no software flip: straight crop).
+        if self._roi is not None:
+            r0, r1, c0, c1 = self._roi
+            frame = frame[r0:r1, c0:c1]
         return np.clip(frame, 0, 4095).astype(np.uint16)

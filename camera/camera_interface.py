@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
@@ -27,18 +26,20 @@ class CameraStatus:
     raw_peak_count: float = 0.0
     board_temp_c: float = float("nan")   # FPGA/electronics board temperature (°C)
     fpa_temp_k: float = float("nan")     # focal-plane array temperature (K)
-
-
-@dataclass(slots=True)
-class MeasurementResult:
-    peak: float
-    total_power: float
-    centroid_x: float
-    centroid_y: float
-    beam_width_x: float
-    beam_width_y: float
-    timestamp: float
-    extras: dict[str, Any] = field(default_factory=dict)
+    exposure_min_ms: float = 0.001       # sensor's shortest exposure (from hardware)
+    exposure_max_ms: float = 1000.0      # sensor's longest exposure (from hardware)
+    binning: int = 1                     # on-sensor (hardware) NxN binning factor
+    binning_options: tuple = (1,)        # the NxN factors the sensor supports
+    gain_db: float = float("nan")        # current sensor gain (dB); NaN = unknown
+    offset_x: int = 0                    # ROI OffsetX on the sensor (camera units)
+    offset_y: int = 0                    # ROI OffsetY on the sensor (camera units)
+    pixel_format: str = ""               # e.g. "Mono16"
+    adc_bit_depth: str = ""              # e.g. "Bit12"
+    frame_rate_hz: float = float("nan")  # AcquisitionFrameRate
+    reverse_x: bool = False              # camera horizontal mirror
+    reverse_y: bool = False              # camera vertical mirror
+    exposure_auto: str = ""              # ExposureAuto (Off/Once/Continuous)
+    gain_auto: str = ""                  # GainAuto (Off/Once/Continuous)
 
 
 def copy_camera_status(status: CameraStatus) -> CameraStatus:
@@ -75,6 +76,16 @@ class CameraInterface(ABC):
 
     def set_option(self, name: str, value) -> None:
         """Set a named camera option (e.g. GenICam node). No-op if unsupported."""
+
+    def set_binning(self, binning: int) -> None:
+        """Set the on-sensor (hardware) NxN binning factor. No-op if unsupported."""
+
+    def set_roi(self, row0: int, row1: int, col0: int, col1: int) -> None:
+        """Crop readout to the given ROI (Width/Height/OffsetX/OffsetY). Rows/cols
+        are in DISPLAYED-frame coordinates (top-left origin). No-op if unsupported."""
+
+    def reset_roi(self) -> None:
+        """Restore full-frame readout (offset 0, maximum Width/Height)."""
 
     @abstractmethod
     def get_status(self) -> CameraStatus:

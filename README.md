@@ -254,15 +254,13 @@ turns it **red** when the chosen step under-samples the shortest wavelength.
   cells into a larger logical pixel. Depending on the selected binning mode,
   the signals can be **summed** (additive) or **averaged**. Summation increases
   sensitivity, while averaging can improve the signal-to-noise ratio.
-  Binning settings can only be changed while the camera is not streaming.
+  Binning settings can only be changed while the camera is not streaming. For this camera, only the software binning is available.
   **Binning and decimation cannot be active simultaneously.**
 - Spinnaker has no on-camera frame averaging, so the **Averaging** control
   averages N frames in software; the effective rate drops by N.
   - **Gain** controls the amplification applied to the pixel signal during
   analog-to-digital conversion. Increasing gain produces a brighter image but
-  also increases noise. For reproducible quantitative measurements, use manual
-  gain by setting `GainAuto` to `Off` and keep the gain fixed between
-  acquisitions. The `Gain` control sets the amplification in dB.
+  also increases noise. The `Gain` control sets the amplification in dB. For this camera, the gain will be used in the Manual Mode. 
 - **Black Level** controls the offset applied to the video signal and determines
   the image baseline in the absence of illumination. The total black level
   includes both analog and digital contributions. For reproducible

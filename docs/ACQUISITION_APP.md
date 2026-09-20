@@ -296,11 +296,11 @@ colormap/gamma, pixel spectra, and a calibration badge via
 `set_calibration_note(meta)` (`set_result`, in-RAM). Full analysis is done in
 external tools that read the saved HDF5 files.
 
-### Metadata captured at scan start (`_scan_meta` + `_cam_meta`)
-start/stop/steps/step_um, frames/point, binning, ROI, apodization+width, wl range,
-n_freq setting, ZPD, walk-off, background_subtracted, saturation level, svd,
-filename — plus the camera dict from `meta_provider` (serial, exposure, averaging,
-board temp, backend).
+### Metadata captured at scan start (`_scan_meta` + camera dict)
+start/stop/steps/step_um, frames/point, apodization, apod centre, wl range,
+n_freq setting, background_subtracted, saturation level, filename — plus the
+camera dict from `meta_provider` (serial, exposure, gain, binning, ROI, board
+temp, backend).
 
 ---
 
@@ -314,9 +314,7 @@ board temp, backend).
 - `dsp.py` — apodization window library (Happ-Genzel, Blackman-Harris 3/4, triangular,
   super-gaussian) **asymmetric-aware**; FWHM-based resolution estimate.
 - `analysis.py` — cube analysis: `saturation_mask`, `roi_average`, `svd_denoise`,
-  `svd_explained_variance`, peak maps, `spectral_derivative`, `spectral_angle_map`.
-- `walkoff.py` — TWINS wedge walk-off correction (per-frame parametric shift +
-  phase-correlation registration). Wired into `compute_hyperspectral(walkoff=...)`.
+  peak maps, `spectral_angle_map`.
 - `spectrum_processor.py` / `hyperspectral.py` — the 1-D and 2-D processors (same math,
   different output dimensionality).
 
@@ -375,6 +373,6 @@ board temp, backend).
 | `instruments/hyperspectral.py` | 2-D per-pixel DFT (`compute_hyperspectral`) |
 | `instruments/spectrum_processor.py` | 1-D interferogram → spectrum |
 | `instruments/h5_writer.py` | ScopeFoundry-layout HDF5 writer/reader |
-| `instruments/{calibration,dsp,analysis,walkoff}.py` | shared processing |
+| `instruments/{calibration,dsp,analysis}.py` | shared processing |
 | `selftest_acquisition.py` | headless end-to-end acquisition check (no hardware) |
 | `Twins/calibration/parameters_{cal,int}.txt` | spectral + motor calibration data |

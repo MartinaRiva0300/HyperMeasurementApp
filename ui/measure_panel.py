@@ -487,12 +487,9 @@ class MeasurePanel(QWidget):
         self.complex_cubes = []
         self.z_values = []
         self.sat_masks = []
-        # Raw interferogram cubes + positions (per z), kept for optional saving
-        # and for walk-off calibration from a sharp-sample scan.
+        # Raw interferogram cubes + positions (per z), kept for optional saving.
         self.raw_cubes = []
         self.raw_positions = []
-        self._last_datacube = None
-        self._last_positions = None
         # Per-run save folder (set on each Acquire in _start); all of a run's
         # files land in <run-stamp>.<filename>/ under the camera folder.
         self._run_folder = None
@@ -509,7 +506,6 @@ class MeasurePanel(QWidget):
         layout.addWidget(self._build_scan_group())
         layout.addWidget(self._build_spectrum_group())
         layout.addWidget(self._build_postproc_group())
-        layout.addWidget(self._build_walkoff_group())
         layout.addWidget(self._build_run_group())
 
         # Persist scan/spectrum params (incl. the wavelength window) between
@@ -520,7 +516,6 @@ class MeasurePanel(QWidget):
         for widget, _cast in self._persisted_spins().values():
             widget.valueChanged.connect(self._save_settings)
         self.combo_apod.currentTextChanged.connect(self._save_settings)
-        self.chk_walkoff.toggled.connect(self._save_settings)
         self.chk_save_raw.toggled.connect(self._save_settings)
         for chk in self._persisted_checks().values():   # sat, svd
             chk.toggled.connect(self._save_settings)
@@ -533,6 +528,7 @@ class MeasurePanel(QWidget):
         self._update_step()
 
     # -- groups --------------------------------------------------------------
+    # Scan group: scan parameters (start, stop, steps, frames/point) and the computed step size.
     def _build_scan_group(self) -> QGroupBox:
         g = QGroupBox("TWINS cube scan")
         grid = QGridLayout(g)
@@ -551,17 +547,17 @@ class MeasurePanel(QWidget):
         grid.addWidget(QLabel("Frames/point"), 4, 0); grid.addWidget(self.spin_frames, 4, 1)
         return g
 
+    # Spectrum group: apodization, wavelength window, spectral points
     def _build_spectrum_group(self) -> QGroupBox:
-        g = QGroupBox("Spectrum (per-pixel DFT)")
+        g = QGroupBox("Spectrum")
         grid = QGridLayout(g)
-        # Apodization window: standard FTIR windows (Apodization.m). No width --
-        # the window is fixed by its family and the ZPD centre.
+        # Apodization window
         self.combo_apod = QComboBox(); self.combo_apod.addItems(APOD_TYPES)
         self.combo_apod.setCurrentText("happ-genzel")
         self.combo_apod.setToolTip("Apodization window. Affects the spectral "
                                    "lineshape and the resolution estimate below.")
         self.combo_apod.currentTextChanged.connect(self._update_step)
-        # MWIR band for this InSb camera (repo defaults are LWIR 8-14 µm).
+        # VIS-SWIR band
         # Overridden by the last-used value once a measurement has been run.
         self.spin_wl0 = self._um_spin(DEFAULT_WL_START)
         self.spin_wl1 = self._um_spin(DEFAULT_WL_STOP)
@@ -611,8 +607,8 @@ class MeasurePanel(QWidget):
         self.combo_center.currentTextChanged.connect(self._save_settings)
         grid.addWidget(QLabel("Apod centre"), 8, 0); grid.addWidget(self.combo_center, 8, 1)
 
-        # Keep the complex DFT instead of its magnitude. The viewer and the
-        # ROI-average CSV still show |spectrum|; only the SAVED cube differs.
+        # Keep the complex spectrum instead of its magnitude. The viewer shows the absolute-valued spectrum;
+        #  only the SAVED cube differs.
         self.chk_complex = QCheckBox("Save complex spectrum (keep phase)")
         self.chk_complex.setToolTip(
             "Save the cube as complex64 -- float32 real + float32 imag -- so the "
@@ -632,74 +628,20 @@ class MeasurePanel(QWidget):
         return "geometric" if self.combo_center.currentText().startswith("geom") \
             else "barycenter"
 
+    # Post-processing group: mask saturated pixels, saturation level
     def _build_postproc_group(self) -> QGroupBox:
         g = QGroupBox("Post-processing")
         grid = QGridLayout(g)
         self.chk_sat = QCheckBox("Mask saturated pixels")
         self.chk_sat.setChecked(True)
-        self.chk_sat.setToolTip("Exclude pixels that clipped at any wedge "
-                                "position from the ROI average and the maps.")
         grid.addWidget(self.chk_sat, 0, 0, 1, 2)
         self.spin_sat = QSpinBox(); self.spin_sat.setRange(1, 65535)
         self.spin_sat.setValue(16383); self.spin_sat.setSuffix(" cts")
-        self.spin_sat.setToolTip("Saturation count level (14-bit full scale = 16383).")
         grid.addWidget(QLabel("Saturation level"), 1, 0); grid.addWidget(self.spin_sat, 1, 1)
 
         return g
 
-    def _build_walkoff_group(self) -> QGroupBox:
-        g = QGroupBox("Walk-off correction (TWINS image drift)")
-        grid = QGridLayout(g)
-        hint = QLabel("Calibrate the per-frame image shift ONCE on a sharp, "
-                      "high-contrast target, then apply it to every scan.")
-        hint.setWordWrap(True); hint.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(hint, 0, 0, 1, 2)
-
-        self.chk_walkoff = QCheckBox("Apply walk-off correction")
-        grid.addWidget(self.chk_walkoff, 1, 0, 1, 2)
-
-        self.spin_wo_y = self._wo_spin(); self.spin_wo_x = self._wo_spin()
-        grid.addWidget(QLabel("Rate Y (px/mm)"), 2, 0); grid.addWidget(self.spin_wo_y, 2, 1)
-        grid.addWidget(QLabel("Rate X (px/mm)"), 3, 0); grid.addWidget(self.spin_wo_x, 3, 1)
-
-        self.btn_wo_cal = QPushButton("Calibrate from last scan")
-        self.btn_wo_cal.setToolTip("Register the frames of the most recent scan "
-                                   "(use a sharp sample) and fit the shift rate.")
-        self.btn_wo_cal.clicked.connect(self._calibrate_walkoff)
-        grid.addWidget(self.btn_wo_cal, 4, 0, 1, 2)
-
-        self.lbl_wo = QLabel("not calibrated")
-        self.lbl_wo.setWordWrap(True); self.lbl_wo.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(self.lbl_wo, 5, 0, 1, 2)
-        return g
-
-    def _wo_spin(self):
-        s = QDoubleSpinBox(); s.setRange(-1000.0, 1000.0); s.setDecimals(4)
-        s.setSingleStep(0.1); s.setValue(0.0); s.setSuffix(" px/mm"); return s
-
-    def _calibrate_walkoff(self) -> None:
-        cube = self._last_datacube
-        pos = self._last_positions
-        if cube is None or pos is None:
-            self.lbl_wo.setText("Run a scan on a sharp sample first, then calibrate.")
-            return
-        self.lbl_wo.setText("calibrating (registering frames)...")
-        self.btn_wo_cal.setEnabled(False)
-        try:
-            from instruments.walkoff import estimate_shift_rate
-            est = estimate_shift_rate(cube, pos)
-            self.spin_wo_y.setValue(est["rate_y"])
-            self.spin_wo_x.setValue(est["rate_x"])
-            self.chk_walkoff.setChecked(True)
-            self.lbl_wo.setText(
-                f"rate_y={est['rate_y']:.3f} (r²={est['r2_y']:.2f}), "
-                f"rate_x={est['rate_x']:.3f} (r²={est['r2_x']:.2f}) px/mm — "
-                f"low r² ⇒ not a clean linear drift / use a sharper sample.")
-        except Exception as e:  # noqa: BLE001
-            self.lbl_wo.setText(f"calibration error: {e}")
-        finally:
-            self.btn_wo_cal.setEnabled(True)
-
+    # Run group (Acquire / Pause / Stop / Save)
     def _build_run_group(self) -> QGroupBox:
         g = QGroupBox("Run")
         v = QVBoxLayout(g)
@@ -792,8 +734,6 @@ class MeasurePanel(QWidget):
             "ks_wl0": (self.spin_wl0, float),
             "ks_wl1": (self.spin_wl1, float),
             "ks_nfreq": (self.spin_nfreq, int),
-            "ks_wo_y": (self.spin_wo_y, float),
-            "ks_wo_x": (self.spin_wo_x, float),
             "ks_sat_level": (self.spin_sat, int),
         }
 
@@ -816,9 +756,6 @@ class MeasurePanel(QWidget):
         ctr = self._settings.value("ks_apod_center", None)
         if ctr is not None:
             self.combo_center.setCurrentText(str(ctr))
-        wo = self._settings.value("ks_walkoff_on", None)
-        if wo is not None:
-            self.chk_walkoff.setChecked(str(wo).lower() == "true")
         for key, chk in self._persisted_checks().items():
             v = self._settings.value(key, None)
             if v is not None:
@@ -835,7 +772,6 @@ class MeasurePanel(QWidget):
             self._settings.setValue(key, widget.value())
         self._settings.setValue("ks_apod_type", self.combo_apod.currentText())
         self._settings.setValue("ks_apod_center", self.combo_center.currentText())
-        self._settings.setValue("ks_walkoff_on", self.chk_walkoff.isChecked())
         for key, chk in self._persisted_checks().items():
             self._settings.setValue(key, chk.isChecked())
         self._settings.setValue("ks_filename", self.edit_filename.text())
@@ -899,8 +835,6 @@ class MeasurePanel(QWidget):
             r0, r1, c0, c1 = roi
             self.sig_status.emit(f"ROI saved for scan: rows {r0}-{r1}, cols {c0}-{c1}")
 
-        walkoff = (dict(rate_y=self.spin_wo_y.value(), rate_x=self.spin_wo_x.value())
-                   if self.chk_walkoff.isChecked() else None)
         # Snapshot the captured background (full frame) + whether to subtract it,
         # taken now so it can't change mid-scan.
         bg, bg_sub = self.bg_provider() if self.bg_provider else (None, False)
@@ -914,7 +848,6 @@ class MeasurePanel(QWidget):
             apod_type=self.combo_apod.currentText(),
             wl0=self.spin_wl0.value(),
             wl1=self.spin_wl1.value(), nfreq=self.spin_nfreq.value(),
-            walkoff=walkoff,
             background=bg, bg_subtract=bool(bg_sub and bg is not None),
             sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
             center_method=self._center_method(),
@@ -931,7 +864,7 @@ class MeasurePanel(QWidget):
             apodization=params["apod_type"],
             wl_start_um=params["wl0"], wl_stop_um=params["wl1"],
             n_freq_setting=params["nfreq"],
-            walkoff=walkoff, background_subtracted=params["bg_subtract"],
+            background_subtracted=params["bg_subtract"],
             saturation_masking=params["sat_on"], saturation_level=params["sat_level"],
             ft_region="full",
             apod_center=params["center_method"],
@@ -982,8 +915,7 @@ class MeasurePanel(QWidget):
         self.btn_pause.setText("Pause")
         self.btn_stop.setEnabled(True)
         self.sp.freeze(True)
-        # One TWINS wedge sweep per Acquire -> a single hyperspectral cube, so the
-        # progress bar tracks the wedge steps of that sweep.
+
         self.progress.setMaximum(max(1, params["n"]))
         self.progress.setValue(0)
         # Live interferogram preview (centerburst forming as the wedge scans).
@@ -993,6 +925,8 @@ class MeasurePanel(QWidget):
         self.live_monitor.show(); self.live_monitor.raise_()
         # Keep the handle so shutdown() can abort + join this scan before the
         # stages are disconnected (else close-during-scan races the stage DLLs).
+
+        # Start the worker thread that runs the scan and DFT. It emits signals to update
         self._scan_thread = threading.Thread(target=self._worker, args=(params,), daemon=True)
         self._scan_thread.start()
 
@@ -1087,10 +1021,6 @@ class MeasurePanel(QWidget):
                     status_cb=lambda m: self.sig_status.emit(m))
 
                 if datacube is not None and len(positions) >= 3:
-                    # Keep the raw cube so walk-off can be calibrated from it
-                    # later (use a sharp-sample scan).
-                    self._last_datacube = datacube
-                    self._last_positions = positions
                     acquired.append({"positions": np.asarray(positions),
                                      "datacube": np.asarray(datacube)})
                     # Dismeasurement guard. Nothing further is acquired after this
@@ -1126,7 +1056,7 @@ class MeasurePanel(QWidget):
                 wl, cube = proc.compute_hyperspectral(
                     positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
                     n_freq=n_freq,
-                    apod_type=p["apod_type"], walkoff=p["walkoff"],
+                    apod_type=p["apod_type"],
                     center_method=p["center_method"],
                     complex_output=p["complex_out"])
                 if cube is None:

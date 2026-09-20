@@ -40,7 +40,7 @@ cube.
 - Steps the TWINS wedge, grabs frame stacks, computes a **per-pixel DFT** →
   spectral cube, motor-nonlinearity calibrated, auto-saved on completion.
 - The **whole acquired interferogram** is always transformed. Apodization type,
-  apodization-centre method, walk-off correction, and saturation masking.
+  apodization-centre method, and saturation masking.
 - **Apod centre** picks where the apodization window sits:
   - `barycentre (per-pixel)` — each pixel's own I² centroid (default), so a ZPD
     that drifts across the field is followed pixel by pixel;
@@ -141,7 +141,7 @@ instruments/          drivers + shared DSP
   hyperspectral.py      2-D per-pixel DFT (compute_hyperspectral)
   spectrum_processor.py 1-D interferogram -> spectrum
   h5_writer.py          ScopeFoundry-layout HDF5 save/load
-  calibration.py dsp.py analysis.py walkoff.py   shared processing
+  calibration.py dsp.py analysis.py   shared processing
 Twins/calibration/      parameters_{cal,int}.txt  spectral + motor calibration
 selftest_acquisition.py  headless mock-camera + simulated-stage acquisition test
 dump_h5_layout.py     print the exact HDF5 layout a measurement produces

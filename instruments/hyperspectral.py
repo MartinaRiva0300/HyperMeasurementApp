@@ -190,7 +190,7 @@ class HyperspectralProcessor:
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
                                n_freq=200, invert=False,
-                               apod_type="happ-genzel", walkoff=None,
+                               apod_type="happ-genzel",
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
                                positions_calibrated=False, center_method="barycenter",
                                complex_output=False):
@@ -232,20 +232,6 @@ class HyperspectralProcessor:
                 positions = np.asarray(calibrate_position_axis(positions), dtype=float)
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Measurement: motor calibration skipped: {e}")
-
-        # Walk-off correction: shift every frame back onto a common grid so each
-        # pixel sees the same scene point across the scan (parametric rate from a
-        # sharp-sample calibration). walkoff = {rate_y, rate_x, ref_mm}.
-        if walkoff:
-            try:
-                from instruments.walkoff import apply_walkoff_correction
-                ry = float(walkoff.get("rate_y", 0.0))
-                rx = float(walkoff.get("rate_x", 0.0))
-                rm = walkoff.get("ref_mm", None)
-                datacube = apply_walkoff_correction(datacube, positions, ry, rx, rm)
-                print(f"[Measurement] walk-off applied: rate_y={ry:.3f} rate_x={rx:.3f} px/mm")
-            except Exception as e:  # noqa: BLE001
-                print(f"[WARN] Measurement: walk-off correction skipped: {e}")
 
         if invert:
             datacube = -datacube

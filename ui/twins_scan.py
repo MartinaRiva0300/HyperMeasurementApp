@@ -160,7 +160,7 @@ class TwinsScanPanel(QWidget):
 
     # -- spectrum params -----------------------------------------------------
     def _build_spectrum_group(self) -> QGroupBox:
-        g = QGroupBox("Spectrum (DFT)")
+        g = QGroupBox("Spectrum")
         grid = QGridLayout(g)
 
         self.spin_wl0 = QDoubleSpinBox()

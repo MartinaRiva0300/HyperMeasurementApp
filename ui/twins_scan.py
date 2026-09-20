@@ -17,8 +17,8 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore
 from PyQt6.QtWidgets import (
-    QDoubleSpinBox, QGroupBox, QGridLayout, QHBoxLayout, QLabel, QProgressBar,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QGroupBox, QGridLayout, QHBoxLayout, QLabel,
+    QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from instruments.subtwinslv import TwinsScanner
@@ -61,6 +61,7 @@ class TwinsScanPanel(QWidget):
         self._restore_settings()
         for widget, _cast in self._persisted_spins().values():
             widget.valueChanged.connect(self._save_settings)
+        self.combo_center.currentTextChanged.connect(self._save_settings)
 
         self._update_step()
 
@@ -86,10 +87,14 @@ class TwinsScanPanel(QWidget):
                 widget.setValue(cast(val))
             except (TypeError, ValueError):
                 pass
+        center = self._settings.value("ts_apod_center", None)
+        if center is not None:
+            self.combo_center.setCurrentText(str(center))
 
     def _save_settings(self, *args) -> None:
         for key, (widget, _cast) in self._persisted_spins().items():
             self._settings.setValue(key, widget.value())
+        self._settings.setValue("ts_apod_center", self.combo_center.currentText())
 
     # -- acquisition ---------------------------------------------------------
     def _build_scan_group(self) -> QGroupBox:
@@ -183,12 +188,29 @@ class TwinsScanPanel(QWidget):
         grid.addWidget(QLabel("N points"), 3, 0)
         grid.addWidget(self.spin_npoints, 3, 1)
 
+        # Apodization centre (ZPD), like the Measure panel.
+        self.combo_center = QComboBox()
+        self.combo_center.addItems(["barycentre", "geometric centre"])
+        self.combo_center.setCurrentText("barycentre")
+        self.combo_center.setToolTip(
+            "Where the apodization window is centred (ZPD):\n"
+            "  barycentre = the interferogram's I² centroid (default)\n"
+            "  geometric centre = the midpoint sample of the scan")
+        grid.addWidget(QLabel("Apod centre"), 4, 0)
+        grid.addWidget(self.combo_center, 4, 1)
+
         btn_row = QHBoxLayout()
         self.btn_save = QPushButton("Save")
         self.btn_save.clicked.connect(self._save)
         btn_row.addWidget(self.btn_save)
-        grid.addLayout(btn_row, 4, 0, 1, 2)
+        grid.addLayout(btn_row, 5, 0, 1, 2)
         return g
+
+    def _center_method(self) -> str:
+        """Apodization-centre method for the processor: 'barycenter' (default)
+        or 'geometric'."""
+        return "geometric" if self.combo_center.currentText().startswith("geom") \
+            else "barycenter"
 
     def _build_plots(self) -> QWidget:
         w = QWidget()
@@ -324,7 +346,8 @@ class TwinsScanPanel(QWidget):
         try:
             wl, spec = self.scanner.processor.compute_spectrum(
                 wl_start=self.spin_wl0.value(), wl_stop=self.spin_wl1.value(),
-                n_points=self.spin_npoints.value())
+                n_points=self.spin_npoints.value(),
+                center_method=self._center_method())
         except Exception as e:  # noqa: BLE001
             self.sig_status.emit(f"spectrum error: {e}")
             return

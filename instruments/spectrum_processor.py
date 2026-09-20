@@ -19,42 +19,6 @@ DEFAULT_WL_STOP = 1.7       # Spectrum display stop (µm)  -- IMX990 cut-off
 DEFAULT_CALIBRATION_FILE = r".\Twins\calibration\parameters_cal.txt"
 
 
-def find_centerburst(signal_1d, positions, expected_zero_mm=None, search_mm=None):
-    """Locate the ZPD (center burst) index from a 1-D interferogram.
-
-    Uses the analytic-signal (Hilbert) envelope rather than argmax(|signal|):
-    the envelope is smooth, so it picks the true burst instead of jumping to the
-    tallest individual fringe or to a baseline edge artifact. If
-    ``expected_zero_mm`` is given the search is limited to +/- ``search_mm``
-    around it (default 5% of the scan span); otherwise the outer ~3% of points
-    are excluded so baseline roll-off at the ends can't win.
-    """
-    s = np.asarray(signal_1d, dtype=float).ravel()
-    n = s.size
-    if n < 4:
-        return int(np.argmax(np.abs(s))) if n else 0
-    try:
-        from scipy.signal import hilbert
-        env = np.abs(hilbert(s - s.mean()))
-    except Exception:  # noqa: BLE001
-        env = np.abs(s - s.mean())
-
-    pos = np.asarray(positions, dtype=float).ravel()
-    span = abs(pos[-1] - pos[0]) if n > 1 else 0.0
-
-    mask = np.ones(n, dtype=bool)
-    if expected_zero_mm is not None and span > 0:
-        hw = search_mm if search_mm is not None else max(0.05 * span, 3.0 * span / n)
-        mask = np.abs(pos - float(expected_zero_mm)) <= hw
-        if not mask.any():
-            mask = np.ones(n, dtype=bool)
-    else:
-        guard = max(1, int(0.03 * n))
-        mask[:guard] = False
-        mask[-guard:] = False
-    return int(np.argmax(np.where(mask, env, -np.inf)))
-
-
 class SpectrumProcessor:
     """
     Process interferogram to spectrum using DFT.
@@ -134,18 +98,21 @@ class SpectrumProcessor:
             return 1.0 / frequencies
 
     def compute_spectrum(self, wl_start=8.0, wl_stop=14.0,
-                         n_points=10000, invert=False,
-                         expected_zero_mm=None, search_mm=None, apod_type="happ-genzel"):
-        """Compute spectrum from interferogram using DFT."""
+                         n_points=10000,
+                         apod_type="happ-genzel", center_method="barycenter"):
+        """Compute spectrum from interferogram using DFT.
+
+        `center_method` sets where the apodization window is centred:
+        "barycenter" (default) = the I^2 barycentre of the interferogram (same
+        formula as the 2-D per-pixel barycentre); "geometric" = the midpoint
+        sample of the scan, ignoring the signal.
+        """
         if self.interferogram is None or self.positions is None:
             return None, None
 
         window_size = max(1, len(self.interferogram) // 5)
         baseline = self.moving_average(self.interferogram, window_size)
         signal = self.interferogram - baseline
-
-        if invert:
-            signal = -signal
 
         # Remove the TWINS wedge motor's reproducible nonlinearity (no-op if the
         # parameters_int.txt position calibration isn't present).
@@ -156,9 +123,17 @@ class SpectrumProcessor:
             print(f"[WARN] motor calibration skipped: {e}")
             c_positions = np.asarray(self.positions, dtype=float)
 
-        center_idx = find_centerburst(signal, c_positions, expected_zero_mm, search_mm)
+        # Apodization centre (ZPD) from the chosen method.
+        sig = np.asarray(signal, dtype=float)
+        if str(center_method).lower().startswith("geom"):
+            center_idx = len(sig) // 2
+        else:
+            w2 = sig ** 2                            # I^2 barycentre
+            k = np.arange(len(sig), dtype=float)
+            center_idx = int(np.round(np.sum(k * w2) / (np.sum(w2) + 1.0)))
+        center_idx = int(np.clip(center_idx, 0, max(0, len(sig) - 1)))
         try:
-            print(f"[SpectrumProcessor] ZPD (burst center): "
+            print(f"[SpectrumProcessor] ZPD centre ({center_method}): "
                   f"{c_positions[center_idx]:.4f} mm (index {center_idx})")
         except Exception:  # noqa: BLE001
             pass

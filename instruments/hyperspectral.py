@@ -17,7 +17,7 @@ DEFAULT_STOP_MM = 24.8
 DEFAULT_N_STEPS = 100
 # Spectral window for the Forge 1GigE SWIR (Sony IMX990 SenSWIR, ~0.4-1.7 µm).
 # The useful upper edge is the sensor cut-off at 1.7 µm.
-DEFAULT_WL_START = 0.9       # µm
+DEFAULT_WL_START = 0.4       # µm
 DEFAULT_WL_STOP = 1.7        # µm
 
 DEFAULT_CALIBRATION_FILE = r".\Twins\calibration\parameters_cal.txt"
@@ -189,9 +189,8 @@ class HyperspectralProcessor:
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
-                               n_freq=200, invert=False,
+                               n_freq=200,
                                apod_type="happ-genzel",
-                               ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
                                positions_calibrated=False, center_method="barycenter",
                                complex_output=False):
         """
@@ -222,6 +221,7 @@ class HyperspectralProcessor:
         if n_pos < 3:
             return None, None
 
+        # Delay axis correction
         # Remove the TWINS wedge motor's reproducible nonlinearity: replace the
         # nominal stage positions with the calibrated axis (parameters_int.txt).
         # No-op if the position calibration file isn't present, or if the caller
@@ -233,13 +233,10 @@ class HyperspectralProcessor:
             except Exception as e:  # noqa: BLE001
                 print(f"[WARN] Measurement: motor calibration skipped: {e}")
 
-        if invert:
-            datacube = -datacube
-
         _method = str(center_method).lower()
 
-        # Helper for baseline & apodization
-        def preprocess(cube, force_center=None, c_pos=None):
+        # Dataset preprocessing: baseline & apodization
+        def preprocess(cube, c_pos=None):
             if c_pos is None:
                 c_pos = positions
 
@@ -250,11 +247,9 @@ class HyperspectralProcessor:
             baseline = uniform_filter1d(cube, size=window, axis=0, mode='nearest')
             sig = cube - baseline
 
-            # ZPD centre: forced (reference-shared), the geometric midpoint, or an
-            # independent per-pixel I^2 barycentre map (default).
-            if force_center is not None:
-                center = force_center
-            elif _method.startswith("geom"):
+            # ZPD centre: the geometric midpoint, or an independent per-pixel
+            # I^2 barycentre map (default).
+            if _method.startswith("geom"):
                 # Geometrical centre of the acquired interferogram: the midpoint
                 # sample. Derived from the scan geometry alone -- no burst search,
                 # no dependence on signal quality.
@@ -262,10 +257,10 @@ class HyperspectralProcessor:
             else:
                 center = barycenter_map(sig)                 # (h, w) per-pixel index map
 
-            scalar = np.ndim(center) == 0
+            scalar = np.ndim(center) == 0 # scalar = True only if the geometric midpoint is used, else False for a per-pixel barycentre.
 
-            cpos_c = c_pos[center]                  # scalar, or (h, w) per-pixel
             try:
+                cpos_c = c_pos[center]              # scalar, or (h, w) per-pixel
                 _c = float(cpos_c) if scalar else float(np.median(cpos_c))
                 print(f"[Measurement PP] ZPD centre ({center_method}): {_c:.4f} mm"
                       + ("" if scalar else " (per-pixel median)"))
@@ -278,29 +273,6 @@ class HyperspectralProcessor:
             else:
                 from instruments.dsp import apodization_window_map
                 apod = apodization_window_map(apod_type, len(c_pos), center)
-
-            # FT-window: which part of the interferogram to transform.
-            #   center -> broad spectral features (low resolution)
-            #   tails  -> high-Q narrow resonances (drop the centerburst)
-            # ft_window_mm=(lo,hi) gives an explicit position window (overrides
-            # ft_region); keep the apodization taper if the window contains the
-            # ZPD, else use a plain boxcar so a tail window isn't suppressed.
-            if ft_window_mm is not None:
-                lo, hi = sorted(float(v) for v in ft_window_mm)
-                inwin = (c_pos >= lo) & (c_pos <= hi)
-                if scalar:
-                    apod = (apod * inwin) if (lo <= cpos_c <= hi) else inwin.astype(float)
-                else:
-                    in_c = (cpos_c >= lo) & (cpos_c <= hi)          # (h, w)
-                    box = np.broadcast_to(inwin[:, None, None].astype(float), apod.shape)
-                    apod = np.where(in_c[None], apod * inwin[:, None, None], box)
-            elif ft_region and str(ft_region).lower() != "full":
-                delta = (np.abs(c_pos - cpos_c) if scalar
-                         else np.abs(c_pos[:, None, None] - cpos_c[None]))
-                if str(ft_region).lower() == "center":
-                    apod = apod * (delta <= ft_width_mm)
-                else:  # "tails": keep the wings, drop the ZPD-centered taper
-                    apod = (delta > ft_width_mm).astype(float)
             apod3 = apod[:, np.newaxis, np.newaxis] if apod.ndim == 1 else apod
             return sig * apod3, center, c_pos
 

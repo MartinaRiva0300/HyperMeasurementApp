@@ -516,7 +516,6 @@ class MeasurePanel(QWidget):
         for widget, _cast in self._persisted_spins().values():
             widget.valueChanged.connect(self._save_settings)
         self.combo_apod.currentTextChanged.connect(self._save_settings)
-        self.chk_save_raw.toggled.connect(self._save_settings)
         for chk in self._persisted_checks().values():   # sat, svd
             chk.toggled.connect(self._save_settings)
         self.edit_filename.editingFinished.connect(self._save_settings)
@@ -684,14 +683,6 @@ class MeasurePanel(QWidget):
         row4b.addWidget(QLabel("Save dir")); row4b.addWidget(self.edit_save_dir, 1)
         row4b.addWidget(self.btn_browse_dir)
         v.addLayout(row4b)
-        self.chk_save_raw = QCheckBox("Raw interferogram saved for reprocessing (always)")
-        self.chk_save_raw.setToolTip("The raw (positions, datacube) is ALWAYS stored "
-                                     "in the .npz so you can reprocess offline (FT window / "
-                                     "apodization / ZPD) without re-scanning. It is small "
-                                     "next to the spectrum (n_pos << n_freq).")
-        self.chk_save_raw.setChecked(True)
-        self.chk_save_raw.setEnabled(False)
-        v.addWidget(self.chk_save_raw)
         self.progress = QProgressBar(); v.addWidget(self.progress)
         self.lbl_status = QLabel("idle"); self.lbl_status.setStyleSheet("color:#888; font-size:11px;")
         self.lbl_status.setWordWrap(True); v.addWidget(self.lbl_status)
@@ -866,7 +857,6 @@ class MeasurePanel(QWidget):
             n_freq_setting=params["nfreq"],
             background_subtracted=params["bg_subtract"],
             saturation_masking=params["sat_on"], saturation_level=params["sat_level"],
-            ft_region="full",
             apod_center=params["center_method"],
             complex_spectrum=params["complex_out"],
             filename=self.edit_filename.text().strip() or "measurement",
@@ -1035,7 +1025,7 @@ class MeasurePanel(QWidget):
                             f"Only {free:.1f} GB free on the save drive — free up "
                             f"space or this acquisition may fail to save.")
 
-            # ---- Phase 2: transform the acquired cube (per-pixel DFT).
+            # Transform the acquired cube.
             for item in acquired:
                 self._wait_if_paused()   # park before the DFT if paused
                 if self._abort:

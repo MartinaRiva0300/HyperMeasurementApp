@@ -10,7 +10,6 @@ thread; progress/results return via Qt signals.
 """
 from __future__ import annotations
 
-import csv
 import os
 from datetime import datetime
 
@@ -23,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from instruments.subtwinslv import TwinsScanner
+from instruments.h5_writer import _require_h5py
 from instruments.spectrum_processor import (
     DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS,
     DEFAULT_WL_START, DEFAULT_WL_STOP,
@@ -102,7 +102,7 @@ class TwinsScanPanel(QWidget):
         self.spin_start.setSingleStep(0.1)
         self.spin_start.setValue(DEFAULT_START_MM)
         self.spin_start.setSuffix(" mm")
-        self.spin_start.valueChanged.connect(self._update_step)
+        self.spin_start.valueChanged.connect(self._update_step) # the step is updated when start is changed
         grid.addWidget(QLabel("Start"), 0, 0)
         grid.addWidget(self.spin_start, 0, 1)
 
@@ -112,14 +112,14 @@ class TwinsScanPanel(QWidget):
         self.spin_stop.setSingleStep(0.1)
         self.spin_stop.setValue(DEFAULT_STOP_MM)
         self.spin_stop.setSuffix(" mm")
-        self.spin_stop.valueChanged.connect(self._update_step)
+        self.spin_stop.valueChanged.connect(self._update_step) #the step is updated when stop is changed
         grid.addWidget(QLabel("Stop"), 1, 0)
         grid.addWidget(self.spin_stop, 1, 1)
 
         self.spin_steps = QSpinBox()
         self.spin_steps.setRange(2, 10000)
         self.spin_steps.setValue(DEFAULT_N_STEPS)
-        self.spin_steps.valueChanged.connect(self._update_step)
+        self.spin_steps.valueChanged.connect(self._update_step) #the step is updated when n° steps is changed
         grid.addWidget(QLabel("Steps"), 2, 0)
         grid.addWidget(self.spin_steps, 2, 1)
 
@@ -184,11 +184,8 @@ class TwinsScanPanel(QWidget):
         grid.addWidget(self.spin_npoints, 3, 1)
 
         btn_row = QHBoxLayout()
-        self.btn_compute = QPushButton("Compute Spectrum")
-        self.btn_compute.clicked.connect(self._compute_spectrum)
         self.btn_save = QPushButton("Save")
         self.btn_save.clicked.connect(self._save)
-        btn_row.addWidget(self.btn_compute)
         btn_row.addWidget(self.btn_save)
         grid.addLayout(btn_row, 4, 0, 1, 2)
         return g
@@ -238,13 +235,16 @@ class TwinsScanPanel(QWidget):
         if self.twins_ctl.busy:
             self.sig_status.emit("stage busy")
             return
+        #Read the scan parameters from the GUI
         start = self.spin_start.value()
         stop = self.spin_stop.value()
         n = self.spin_steps.value()
+        #Read in the ROI from the GUI
         roi = self._current_roi()
         self._scan_roi = roi          # ROI averaged per point, saved with the scan
-        frames = self.spin_frames.value()
+        frames = self.spin_frames.value()   # frames averaged per point, saved with the scan
 
+        # Run the scan 
         self.scanner = TwinsScanner(drv, self.frame_source)
         self._abort = False
         self.btn_scan.setEnabled(False)
@@ -258,12 +258,26 @@ class TwinsScanPanel(QWidget):
             def prog(i, total, pos, val):
                 self.sig_progress.emit(i, total, pos, val)
             try:
-                pos, ifg = self.scanner.scan(
+                # One shared camera+stage scan (returns the full ROI frame stack);
+                # the 1-D interferogram is the per-step frame mean, computed here.
+                pos, cube = self.scanner.scan_cube(
                     start, stop, n, roi=roi, frames_avg=frames,
-                    progress=prog, should_abort=lambda: self._abort)
+                    progress=prog, should_abort=lambda: self._abort,
+                    status_cb=lambda m: self.sig_status.emit(m))
+                if cube is None or len(pos) == 0:
+                    self.sig_scan_done.emit(None, None)
+                    return
+                pos = np.asarray(pos, dtype=float)
+                ifg = np.asarray(cube, dtype=float).mean(axis=(1, 2))
+                # Store on the scanner + processor so Save and the spectrum use them.
+                self.scanner.positions = pos
+                self.scanner.interferogram = ifg
+                self.scanner.processor.set_data(pos, ifg)
+                # Emit the results to the GUI thread: on-scan-done slot will update the plots and compute the spectrum.
                 self.sig_scan_done.emit(pos, ifg)
             except Exception as e:  # noqa: BLE001
                 self.sig_status.emit(f"scan error: {e}")
+                # Emit the results to the GUI thread: on-scan-done slot will give an error message.
                 self.sig_scan_done.emit(None, None)
 
         # Run via the controller so its poll timer pauses (no DLL contention).
@@ -274,6 +288,7 @@ class TwinsScanPanel(QWidget):
         self.sig_status.emit("stopping...")
 
     @QtCore.pyqtSlot(int, int, float, float)
+    # Update the progress bar and status label during the scan.
     def _on_progress(self, i: int, n: int, pos: float, val: float) -> None:
         self.progress.setValue(i)
         self.lbl_status.setText(f"point {i}/{n}  @ {pos:.3f} mm  =  {val:.1f}")
@@ -285,24 +300,29 @@ class TwinsScanPanel(QWidget):
 
     @QtCore.pyqtSlot(object, object)
     def _on_scan_done(self, positions, interferogram) -> None:
-        self.btn_scan.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        self.btn_scan.setEnabled(True) #Scan button is re-enabled after the scan is done
+        self.btn_stop.setEnabled(False) #Stop button is disabled after the scan is done
         if positions is None or interferogram is None or len(positions) == 0:
             self.sig_status.emit("scan aborted / no data")
             return
         self._positions = np.asarray(positions)
         self._interferogram = np.asarray(interferogram)
+
+        # Update the interferogram plot with the full scan data
         self.curve_ifg.setData(self._positions, self._interferogram)
         self.sig_status.emit(f"scan done: {len(self._positions)} points")
+
+        # Every scan auto-computes the spectrum with the current spectrum params.
         self._compute_spectrum()
 
     # -- spectrum ------------------------------------------------------------
+    # Auto-run after each scan: DFT the interferogram via SpectrumProcessor.
     def _compute_spectrum(self) -> None:
         if self.scanner is None or self.scanner.positions is None or len(self.scanner.positions) == 0:
             self.sig_status.emit("no scan to process")
             return
         try:
-            wl, spec = self.scanner.compute_spectrum(
+            wl, spec = self.scanner.processor.compute_spectrum(
                 wl_start=self.spin_wl0.value(), wl_stop=self.spin_wl1.value(),
                 n_points=self.spin_npoints.value())
         except Exception as e:  # noqa: BLE001
@@ -311,30 +331,51 @@ class TwinsScanPanel(QWidget):
         if wl is None or spec is None:
             self.sig_status.emit("spectrum unavailable")
             return
+        # Update the spectrum plot with the computed spectrum data
         self.curve_spec.setData(np.asarray(wl), np.asarray(spec))
         peak = float(wl[int(np.argmax(spec))])
         self.sig_status.emit(f"spectrum: peak ~{peak:.2f} µm")
 
     def _save(self) -> None:
+        
         if self.scanner is None or self.scanner.positions is None or len(self.scanner.positions) == 0:
             self.sig_status.emit("nothing to save")
             return
         try:
             os.makedirs(self.save_dir, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            stem = os.path.join(self.save_dir, f"twins_scan_{stamp}")
-            with open(stem + ".csv", "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["position_mm", "interferogram"])
-                for p, v in zip(self.scanner.positions, self.scanner.interferogram):
-                    w.writerow([p, v])
+            stem = os.path.join(self.save_dir, f"{stamp}_twins_scan")
+
+            raw_pos = np.asarray(self.scanner.positions, dtype=float)
+            # Motor-nonlinearity-corrected axis (parameters_int.txt) -- the SAME
+            # correction the DFT applies internally. No-op (returns raw) if the
+            # calibration file isn't present.
+            from instruments.calibration import (calibrate_position_axis,
+                                                  position_calibration_status)
+            positions = np.asarray(calibrate_position_axis(raw_pos), dtype=float)
+            cal_available, cal_file = position_calibration_status()
+
+            ifg = np.asarray(self.scanner.interferogram)
             roi = getattr(self, "_scan_roi", None)
-            np.savez(stem + ".npz",
-                     positions=self.scanner.positions,
-                     interferogram=self.scanner.interferogram,
-                     wavelengths=self.scanner.processor.wavelengths,
-                     spectrum=self.scanner.processor.spectrum,
-                     roi=np.asarray(roi if roi is not None else [], dtype=float))
-            self.sig_status.emit(f"saved {os.path.basename(stem)}.csv/.npz")
+            h5py = _require_h5py()
+            with h5py.File(stem + ".h5", "w") as f:
+                pos = f.create_dataset("positions", data=positions)  # corrected axis
+                pos.attrs["units"] = "mm"
+                pos.attrs["axis"] = "calibrated" if cal_available else "raw_measured"
+                if cal_file:
+                    pos.attrs["calibration_file"] = cal_file
+                # Keep the raw measured axis too when a correction was applied.
+                if cal_available:
+                    f.create_dataset("positions_raw", data=raw_pos)
+                f.create_dataset("interferogram", data=ifg)
+                if self.scanner.processor.wavelengths is not None:
+                    f.create_dataset("wavelengths",
+                                     data=np.asarray(self.scanner.processor.wavelengths))
+                if self.scanner.processor.spectrum is not None:
+                    f.create_dataset("spectrum",
+                                     data=np.asarray(self.scanner.processor.spectrum))
+                if roi is not None:
+                    f.attrs["roi"] = np.asarray(roi, dtype=float)
+            self.sig_status.emit(f"saved {os.path.basename(stem)}.h5")
         except Exception as e:  # noqa: BLE001
             self.sig_status.emit(f"save error: {e}")

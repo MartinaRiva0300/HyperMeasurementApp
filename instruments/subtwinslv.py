@@ -1,31 +1,3 @@
-"""
-subtwinslv.py -- TWINS interferometer scan + FTIR spectrum.
-
-System 2 of the setup: a NIREOS TWINS common-path interferometer. We scan its
-internal wedge stage (twins_stage.TwinsStage) and, at each position, read a
-scalar from the camera (ROI mean of a frame) to build an interferogram, then
-DFT it into a spectrum using a NIREOS calibration file.
-
-Ported from the LabVIEW pump-probe code (sub_twins_lw.py) but DECOUPLED from
-LabVIEW: instead of triggering Experiment_manager.vi it takes any
-`frame_source` callable returning a 2-D numpy frame -- e.g. our Forge SWIR camera's
-`get_frame`. The interferogram->spectrum math is the VERBATIM repo
-`SpectrumProcessor` (instruments/spectrum_processor.py, pandas+scipy). Runs a
-simulated scan with no hardware via `simulate=True`.
-
-Usage (with the real camera, later):
-    from instruments.twins_stage import TwinsStage
-    from instruments.subtwinslv import TwinsScanner
-    stage = TwinsStage(); stage.connect()
-    scanner = TwinsScanner(stage, frame_source=camera.get_frame,
-                           calibration_file=r"...\\parameters_cal.txt")
-    pos, ifg = scanner.scan(23.8, 24.8, 120, roi=(200, 320, 250, 400))
-    wl, spec = scanner.compute_spectrum(wl_start=8.0, wl_stop=14.0)
-    scanner.save("twins_scan")
-
-Usage (now, no hardware):
-    python subtwinslv.py            # runs a simulated scan + spectrum
-"""
 from __future__ import annotations
 
 import csv
@@ -62,7 +34,9 @@ def bin_image(img: np.ndarray, factor: int) -> np.ndarray:
 
 
 # ===========================================================================
-# TWINS scanner -- drives the stage + reads scalars from a frame source
+# TWINS scanner -- drives the stage + reads ROI frames from a frame source.
+# One step-scan engine (scan_cube) is shared by both the 1-D TWINS scan (which
+# takes the per-step frame mean) and the Measure-tab hyperspectral cube.
 # ===========================================================================
 class TwinsScanner:
     def __init__(self, stage, frame_source: FrameSource,
@@ -72,79 +46,6 @@ class TwinsScanner:
         self.processor = SpectrumProcessor(calibration_file)
         self.positions = None
         self.interferogram = None
-
-    @staticmethod
-    def _roi_mean(frame: np.ndarray, roi: Roi) -> float:
-        if frame is None:
-            return float("nan")
-        if roi is None:
-            return float(np.mean(frame))
-        r0, r1, c0, c1 = roi
-        return float(np.mean(frame[r0:r1, c0:c1]))
-
-    def _read_scalar(self, roi: Roi, frames_avg: int,
-                     discard: int = 1, timeout_s: float = 2.0) -> float:
-        """Average `frames_avg` FRESH ROI means at the current wedge position.
-
-        Like _read_roi_slice, only DISTINCT camera frames are averaged (a slow
-        camera never gets the same buffered frame counted twice) and the first
-        `discard` new frames after the move are dropped as possibly-in-flight.
-        Falls back to whatever frame is available if the stream stalls.
-        """
-        vals = []
-        last = self.frame_source()           # pre-settle frame: wait for it to change
-        deadline = time.time() + timeout_s
-        dropped = 0
-        while len(vals) < max(1, frames_avg):
-            frame = self.frame_source()
-            if frame is None or frame is last:
-                if time.time() > deadline:
-                    break
-                time.sleep(0.002)
-                continue
-            last = frame
-            deadline = time.time() + timeout_s
-            if dropped < discard:            # skip a possibly in-flight frame
-                dropped += 1
-                continue
-            vals.append(self._roi_mean(frame, roi))
-        if not vals:                         # stream stalled -> use latest frame
-            vals.append(self._roi_mean(self.frame_source(), roi))
-        return float(np.nanmean(vals))
-
-    def scan(self, start_mm: float, stop_mm: float, n_steps: int,
-             roi: Roi = None, settle_s: float = 0.05, frames_avg: int = 1,
-             progress: Optional[Callable[[int, int, float, float], None]] = None,
-             should_abort: Optional[Callable[[], bool]] = None):
-        """Move the TWINS stage across [start, stop] and build the interferogram.
-
-        Step size = abs(stop-start)/(n_steps-1). Returns (positions_mm,
-        interferogram). `progress(i, n, pos, value)` is called per point if
-        supplied; `should_abort()` is polled per point to allow a clean stop
-        (returns the partial scan truncated to the points taken).
-        """
-        targets = np.linspace(start_mm, stop_mm, int(n_steps))
-        positions = np.zeros(n_steps)
-        interferogram = np.zeros(n_steps)
-        taken = 0
-        for i, target in enumerate(targets):
-            if should_abort is not None and should_abort():
-                break
-            self.stage.move_to(float(target))
-            self.stage.wait_for_stop()
-            if settle_s:
-                time.sleep(settle_s)
-            positions[i] = self.stage.get_position()
-            interferogram[i] = self._read_scalar(roi, frames_avg)
-            taken = i + 1
-            if progress:
-                progress(taken, n_steps, positions[i], interferogram[i])
-        positions = positions[:taken]
-        interferogram = interferogram[:taken]
-        self.positions = positions
-        self.interferogram = interferogram
-        self.processor.set_data(positions, interferogram)
-        return positions, interferogram
 
     def _read_roi_slice(self, roi: Roi, frames_avg: int, bin_factor: int = 1,
                         discard: int = 1, timeout_s: float = 2.0, background=None):
@@ -220,6 +121,7 @@ class TwinsScanner:
             status_cb("camera did not recover (timeout) -- stopping scan")
         return False
 
+    # Scan 
     def scan_cube(self, start_mm: float, stop_mm: float, n_steps: int,
                   roi: Roi, settle_s: float = 0.05, frames_avg: int = 1,
                   bin_factor: int = 1, discard_frames: int = 1, background=None,
@@ -267,27 +169,9 @@ class TwinsScanner:
         self.datacube = np.asarray(cube) if cube else None
         return self.cube_positions, self.datacube
 
-    def compute_spectrum(self, **kwargs):
-        return self.processor.compute_spectrum(**kwargs)
-
-    def save(self, basename: str = "twins_scan", out_dir: str = "scan_data") -> str:
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        stem = str(Path(out_dir) / f"{basename}_{stamp}")
-        with open(stem + ".csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["position_mm", "interferogram"])
-            for p, v in zip(self.positions, self.interferogram):
-                w.writerow([p, v])
-        np.savez(stem + ".npz",
-                 positions=self.positions, interferogram=self.interferogram,
-                 wavelengths=self.processor.wavelengths, spectrum=self.processor.spectrum)
-        print(f"[TWINS] saved {stem}.csv / .npz")
-        return stem
-
 
 # ===========================================================================
-# Simulated demo (no hardware): synthetic two-line MWIR source
+# Simulated demo (no hardware): synthetic two-line source
 # ===========================================================================
 def _simulated_demo():
     from twins_stage import TwinsStage
@@ -308,14 +192,11 @@ def _simulated_demo():
         return np.full((32, 32), value, dtype=np.float32)
 
     scanner = TwinsScanner(stage, frame_source)
-    pos, ifg = scanner.scan(23.8, 24.8, 200,
-                            progress=lambda i, n, p, v: None)
-    wl, spec = scanner.compute_spectrum(wl_start=4.0, wl_stop=12.0)
+    pos, cube = scanner.scan_cube(23.8, 24.8, 200, roi=None,
+                                  progress=lambda i, n, p, v: None)
+    ifg = cube.mean(axis=(1, 2))   # frame mean per step -> 1-D interferogram
     print(f"[demo] scanned {len(pos)} pts; interferogram "
           f"min/max {ifg.min():.0f}/{ifg.max():.0f}")
-    if spec is not None:
-        peak = wl[int(np.argmax(spec))]
-        print(f"[demo] spectrum computed ({len(spec)} pts); peak ~{peak:.2f} µm")
     stage.disconnect()
 
 

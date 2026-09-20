@@ -288,6 +288,7 @@ class ForgeSwirCamera(CameraInterface):
             node.SetValue(us)
             actual = node.GetValue() / 1000.0
             self.status.exposure_ms = actual
+            self._refresh_frame_rate()   # exposure changes the resulting rate
             self.status.message = f"Exposure {actual:.3f} ms"
         except Exception as e:  # noqa: BLE001
             self.status.message = f"set_exposure failed: {e}"
@@ -372,6 +373,7 @@ class ForgeSwirCamera(CameraInterface):
         finally:
             if was_streaming:
                 self.start_acquisition()
+            self._refresh_frame_rate()   # binning changes the resulting rate
 
     def _set_int_node(self, name: str, value) -> int | None:
         """Clamp `value` to an integer node's [min, max], snap DOWN to its
@@ -416,6 +418,22 @@ class ForgeSwirCamera(CameraInterface):
         except Exception:  # noqa: BLE001
             pass
 
+    def _refresh_frame_rate(self) -> None:
+        """Read the RESULTING (achievable) frame rate at the current exposure/ROI/
+        binning/bandwidth into status.frame_rate_hz. Falls back to the settable
+        AcquisitionFrameRate node if the resulting one isn't exposed."""
+        if self._cam is None:
+            return
+        PySpin = self._spin
+        for name in ("AcquisitionResultingFrameRate", "AcquisitionFrameRate"):
+            try:
+                node = PySpin.CFloatPtr(self._nodemap.GetNode(name))
+                if PySpin.IsReadable(node):
+                    self.status.frame_rate_hz = float(node.GetValue())
+                    return
+            except Exception:  # noqa: BLE001
+                continue
+
     def _refresh_camera_settings(self) -> None:
         """Read the current values of every exposed camera setting into status, so
         the saved metadata reflects what the camera is ACTUALLY doing (not just
@@ -441,18 +459,9 @@ class ForgeSwirCamera(CameraInterface):
                 pass
             return False
 
-        def read_float(name):
-            try:
-                node = PySpin.CFloatPtr(nm.GetNode(name))
-                if PySpin.IsReadable(node):
-                    return float(node.GetValue())
-            except Exception:  # noqa: BLE001
-                pass
-            return float("nan")
-
         self.status.pixel_format = enum_sym("PixelFormat")
         self.status.adc_bit_depth = enum_sym("AdcBitDepth")
-        self.status.frame_rate_hz = read_float("AcquisitionFrameRate")
+        self._refresh_frame_rate()   # RESULTING (achievable) rate, read-only
         self.status.reverse_x = read_bool("ReverseX")
         self.status.reverse_y = read_bool("ReverseY")
         self.status.exposure_auto = enum_sym("ExposureAuto")
@@ -520,6 +529,7 @@ class ForgeSwirCamera(CameraInterface):
         finally:
             if was:
                 self.start_acquisition()
+            self._refresh_frame_rate()   # ROI changes the resulting rate
 
     def set_option(self, name: str, value) -> None:
         """Set a GenICam node by name (ExposureAuto, GainAuto, PixelFormat,
@@ -644,6 +654,16 @@ class ForgeSwirCamera(CameraInterface):
         self._set_enum("ExposureMode", "Timed")
         self._set_enum("GainAuto", "Off")
 
+        # No manual frame-rate cap: the camera free-runs at the RESULTING rate
+        # allowed by exposure/ROI/binning/bandwidth (the UI shows that value,
+        # read-only). Disabling the cap keeps the reported rate == delivered rate.
+        try:
+            node = PySpin.CBooleanPtr(nm.GetNode("AcquisitionFrameRateEnable"))
+            if PySpin.IsWritable(node):
+                node.SetValue(False)
+        except Exception:  # noqa: BLE001
+            pass
+
         # Pixel format: prefer Mono16 so the app's uint16 path is exact.
         chosen = ""
         for fmt in PIXEL_FORMAT_PREFS:
@@ -669,8 +689,13 @@ class ForgeSwirCamera(CameraInterface):
                 node.SetValue(int(min(9000, node.GetMax())))
         except Exception:  # noqa: BLE001
             pass
-        # Don't let a throughput cap pace the stream below the sensor rate.
-        self._set_enum("DeviceLinkThroughputLimitMode", "Off")
+        # Keep the GigE throughput limit ON so the camera paces itself to what the
+        # 1 GigE link can actually carry -- this prevents dropped/incomplete frames
+        # AND makes AcquisitionResultingFrameRate report the REAL working rate
+        # (with the limit off it reports the sensor-timing max, e.g. >700 Hz, which
+        # the link can't deliver). With AcquisitionFrameRateEnable=False the camera
+        # free-runs at exactly this resulting rate.
+        self._set_enum("DeviceLinkThroughputLimitMode", "On")
 
         # Binning: drive the "All" engine and re-apply the remembered factor
         # (H == V). Done before the geometry read below so Width/Height reflect

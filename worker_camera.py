@@ -207,11 +207,6 @@ def camera_worker(frame_queue: mp.Queue, control_queue: mp.Queue, camera_config:
                             pass
                     publish_status(frame_queue, camera.get_status())
                     continue
-                if cmd_type == "snapshot":
-                    frame = camera.get_frame()
-                    if frame is not None:
-                        publish_frame(frame_queue, frame, shared_frame)
-                    continue
             except queue.Empty:
                 pass
 

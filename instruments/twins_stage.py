@@ -13,7 +13,7 @@ at this class's API; the MCS2 works in **picometres** internally.
 
 This module is hardware-only (NO GUI) and keeps the SAME public API the rest of
 the app already calls, so the scan engine (subtwinslv.py) and the stage UI
-(ui/stages.py) need no changes:
+(ui/stage.py) need no changes:
 
     connect(simulate=False, home=True) -> bool
     disconnect(safe=True) -> None

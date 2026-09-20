@@ -25,9 +25,11 @@ cube.
 - Auto or fixed Min/Max colorbar; click a pixel for horizontal/vertical profiles.
 - Exposure 0.001–1000 ms, software frame averaging, background capture /
   subtraction, snapshot, camera temperature readout.
-- Forge GenICam options exposed directly: `ExposureAuto`, `GainAuto`,
-  `PixelFormat`, `AdcBitDepth`, `AcquisitionFrameRate`.
-- On-image draggable **ROI** + binning, shared by the measurement panels.
+- Forge GenICam options exposed directly: `ExposureAuto`, `PixelFormat`,
+  `AdcBitDepth`, manual `Gain`, `ReverseX`/`ReverseY`. The frame rate is shown
+  **read-only** (`AcquisitionResultingFrameRate`) — the camera free-runs at the
+  rate the current exposure/ROI/binning allow.
+- On-image draggable **ROI** + sensor binning, shared by the measurement panels.
 
 **TWINS**
 - Connect / go-to / jog for the SLC-1750 wedge stage, with a no-hardware
@@ -37,18 +39,15 @@ cube.
 **Hyperspectral measurement (Measure tab)**
 - Steps the TWINS wedge, grabs frame stacks, computes a **per-pixel DFT** →
   spectral cube, motor-nonlinearity calibrated, auto-saved on completion.
-- The **whole acquired interferogram** is always transformed. Apodization type
-  and width, apodization-centre method, walk-off correction, saturation masking,
-  and a **Recompute** button that re-runs the DFT on the stored raw interferogram
-  with new settings — no re-scan.
+- The **whole acquired interferogram** is always transformed. Apodization type,
+  apodization-centre method, walk-off correction, and saturation masking.
 - **Apod centre** picks where the apodization window sits:
   - `barycentre (per-pixel)` — each pixel's own I² centroid (default), so a ZPD
     that drifts across the field is followed pixel by pixel;
-  - `envelope (field)` — one Hilbert-envelope centre-burst for the whole frame;
   - `geometric centre` — the midpoint sample of the scan, ignoring the signal
     entirely (use when the scan is already deliberately centred on ZPD).
 
-  The first two are found from the acquired data — no expected ZPD position is
+  The barycentre is found from the acquired data — no expected ZPD position is
   assumed.
 - **Save complex spectrum (keep phase)** — writes the cube as `complex64`
   (**float32 real + float32 imag**), keeping the interferometric phase alongside
@@ -56,25 +55,26 @@ cube.
   float32 either way; the cube grows from 4 to 8 bytes per element only because
   two numbers are stored per element instead of one — that is the smallest form
   that can carry phase. Both save paths pin the dtype to `complex64`, so nothing
-  can upcast to `complex128`. The viewer, the maps and the ROI-average CSV always
-  display `|spectrum|`, so nothing changes on screen. Off by default.
+  can upcast to `complex128`. The viewer and the maps always display
+  `|spectrum|`, so nothing changes on screen. Off by default.
 - **Save format** is HDF5 only: every run writes the two MATLAB-compatible
   hypercube files — see below.
-- Built-in **HyperViewer**: λ-scrub / peak-λ / peak-intensity / SAM /
-  **continuum-line** maps, per-pixel spectra, colormaps.
+- At the end of each measurement the built-in **HyperViewer** opens
+  automatically for a quick look (λ-scrub / peak-λ / peak-intensity maps,
+  per-pixel spectra, colormaps).
 
 **Analysis**
-- Hypercubes are analysed in external, pre-existing tools that read the saved
-  HDF5 files (see below). A lightweight in-repo cube viewer
-  (`view_hyperspectral.py`) can also open past scans.
+- Hypercubes are analysed in **external, pre-existing tools** that read the saved
+  HDF5 files (see below); the app itself only auto-opens the HyperViewer for a
+  quick post-scan look.
 
 ## Save formats
 
 Every run writes **two HDF5 files** into its run folder, in the layout the lab's
 pre-existing MATLAB analysis codes expect. Spatial axes come first in both cubes.
 HDF5 is the only format (it needs `h5py`; saving reports a clear error without
-it). The ROI-average CSV is unaffected. The Measure tab's Load button reads the
-spectral file back for viewing.
+it). The HyperViewer opens automatically at the end of a measurement; there is no
+in-app file loader — open saved datasets in your own analysis tools.
 
 **`<run-stamp>.<filename>_hyp.h5`** — temporal hypercube, in the `HyperMatrix` /
 DelayCorrection layout the pre-existing MATLAB code reads:
@@ -132,7 +132,7 @@ camera/               camera abstraction + backends
   factory.py            create_camera(mode)
 ui/
   main_window.py        orchestrator: live view, controls, background, ROI, save
-  stages.py             TWINS wedge-stage control panel
+  stage.py              TWINS wedge-stage control panel
   twins_scan.py         live 1-D TWINS interferogram scan
   measure_panel.py     the hyperspectral experiment + HyperViewer
 instruments/          drivers + shared DSP

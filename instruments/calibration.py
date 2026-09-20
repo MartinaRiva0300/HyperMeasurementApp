@@ -1,9 +1,6 @@
 """
 calibration.py -- shared TWINS / Gemini calibration loaders.
-
-Ported from the reference repo (gmike92/Hyperspectral_MIDIR_pumpprobe,
-calibration.py) so the wavelength axis and the motor-nonlinearity correction
-here are identical to the reference setup. Two tab-separated 2-row files live
+Two tab-separated 2-row files live
 under ``Twins/calibration/``:
 
     parameters_cal.txt   Spectral calibration: row0 = wavelength (µm),

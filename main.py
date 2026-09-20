@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
         description="Forge 1GigE SWIR + TWINS hyperspectral acquisition")
     parser.add_argument(
         "--mode",
-        choices=("auto", "forge", "mock"),
+        choices=("forge", "mock"),
         default="forge",
         help="Camera backend (forge = Teledyne FLIR Forge 1GigE SWIR via "
              "Spinnaker/PySpin; mock = synthetic frames, no hardware)",
@@ -32,6 +32,8 @@ if __name__ == "__main__":
     mp.freeze_support()
     args = parse_args()
 
+    # Define queues for inter-process communication: frame_queue is for frames 
+    # from the camera worker to the GUI, control_queue is for commands from the GUI to the camera worker.
     frame_queue = mp.Queue(maxsize=4)
     control_queue = mp.Queue()
     # Shared-memory frame buffer. Sized well above the Forge's 1280x1024 so a
@@ -47,10 +49,12 @@ if __name__ == "__main__":
         "shared_frame_shape": frame_buffer_shape,
     }
 
+    # Define and start the camera worker process, passing the queues and configuration.
     process = mp.Process(target=camera_worker, args=(frame_queue, control_queue, worker_config))
     process.start()
     logger.info(f"Camera worker started with PID {process.pid}")
 
+    # Start the Qt application and main window, passing the queues and shared memory information.
     app = QApplication(sys.argv)
     window = MainWindow(
         frame_queue,

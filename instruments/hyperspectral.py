@@ -1,11 +1,9 @@
 """
 hyperspectral.py -- per-pixel TWINS DFT (Measurement hyperspectral).
-
-Verbatim port of the repo's HyperspectralProcessor
-(gmike92/Labview-pumprobepython, sub_kspace_lw.py): takes a 3-D datacube
+Takes a 3-D datacube
 (n_positions, h, w) of ROI frames acquired while scanning the TWINS wedge and
 runs an independent DFT for every pixel, returning a spectrum cube
-(n_freq, h, w) plus the wavelength axis (µm via the NIREOS calibration).
+(n_freq, h, w) plus the wavelength axis.
 
 Heavy step is `phase_kernel.conj().T @ flat`; keep the ROI modest (a spectrum
 cube is n_freq * h * w complex128 during compute).
@@ -17,7 +15,6 @@ from pathlib import Path
 DEFAULT_START_MM = 23.8
 DEFAULT_STOP_MM = 24.8
 DEFAULT_N_STEPS = 100
-DEFAULT_APODIZATION = 0.2
 # Spectral window for the Forge 1GigE SWIR (Sony IMX990 SenSWIR, ~0.4-1.7 µm).
 # The useful upper edge is the sensor cut-off at 1.7 µm.
 DEFAULT_WL_START = 0.9       # µm
@@ -33,12 +30,6 @@ ZEROFILL_FACTOR = 1.5
 ZEROFILL_MIN = 512
 ZEROFILL_MAX = 4096
 
-# Centerburst (ZPD) search defaults (NIREOS TWINS wedge): the burst sits ~here
-# with small run-to-run drift; detection is the envelope max within +/- window.
-DEFAULT_ZPD_MM = 24.33
-DEFAULT_ZPD_WINDOW_MM = 0.1
-
-
 def resolve_n_points(n_steps, manual=None):
     """Number of spectral output bins (interpolation only).
 
@@ -49,42 +40,6 @@ def resolve_n_points(n_steps, manual=None):
     if manual and manual > 0:
         return int(manual)
     return int(np.clip(ZEROFILL_FACTOR * int(n_steps), ZEROFILL_MIN, ZEROFILL_MAX))
-
-
-def find_centerburst(signal_1d, positions, expected_zero_mm=None, search_mm=None):
-    """Locate the ZPD (center burst) index from a 1-D interferogram.
-
-    Uses the analytic-signal (Hilbert) envelope rather than argmax(|signal|):
-    the envelope is smooth, so it picks the true burst instead of jumping to the
-    tallest individual fringe or to a baseline edge artifact. If
-    ``expected_zero_mm`` is given the search is limited to +/- ``search_mm``
-    around it (default 5% of the scan span); otherwise the outer ~3% of points
-    are excluded so baseline roll-off at the ends can't win.
-    """
-    s = np.asarray(signal_1d, dtype=float).ravel()
-    n = s.size
-    if n < 4:
-        return int(np.argmax(np.abs(s))) if n else 0
-    try:
-        from scipy.signal import hilbert
-        env = np.abs(hilbert(s - s.mean()))
-    except Exception:  # noqa: BLE001
-        env = np.abs(s - s.mean())
-
-    pos = np.asarray(positions, dtype=float).ravel()
-    span = abs(pos[-1] - pos[0]) if n > 1 else 0.0
-
-    mask = np.ones(n, dtype=bool)
-    if expected_zero_mm is not None and span > 0:
-        hw = search_mm if search_mm is not None else max(0.05 * span, 3.0 * span / n)
-        mask = np.abs(pos - float(expected_zero_mm)) <= hw
-        if not mask.any():
-            mask = np.ones(n, dtype=bool)
-    else:
-        guard = max(1, int(0.03 * n))
-        mask[:guard] = False
-        mask[-guard:] = False
-    return int(np.argmax(np.where(mask, env, -np.inf)))
 
 
 def barycenter_map(sig):
@@ -191,10 +146,6 @@ class HyperspectralProcessor:
         except Exception:  # noqa: BLE001
             return None
 
-    def nyquist_step_um(self, wl_short_um):
-        """Nyquist (2 samples/cycle) stage step at the shortest wavelength."""
-        return self.max_step_um(wl_short_um, samples_per_cycle=2)
-
     def estimate_resolution(self, scan_range_mm, wl_center_um, apod_type="happ-genzel"):
         """Spectral resolution from the stage scan range, as ``(value, unit)``.
 
@@ -239,20 +190,18 @@ class HyperspectralProcessor:
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
                                n_freq=200, invert=False,
-                               expected_zero_mm=None, search_mm=None,
                                apod_type="happ-genzel", walkoff=None,
                                ft_region="full", ft_width_mm=0.1, ft_window_mm=None,
-                               positions_calibrated=False, center_method="envelope",
+                               positions_calibrated=False, center_method="barycenter",
                                complex_output=False):
         """
         Compute per-pixel DFT on a (n_pos, h, w) datacube.
 
         `center_method`: where the apodization window is centred --
-        "envelope" (default) = one Hilbert-envelope centre-burst for the whole
-        field (signed spatial sum); "barycenter" = an independent I^2 barycentre
-        per pixel, so a ZPD that varies across the field is followed per pixel;
-        "geometric" = the midpoint sample of the acquired scan, ignoring the
-        signal entirely (use when the scan is deliberately centred on ZPD).
+        "barycenter" (default) = an independent I^2 barycentre per pixel, so a ZPD
+        that varies across the field is followed per pixel; "geometric" = the
+        midpoint sample of the acquired scan, ignoring the signal entirely (use
+        when the scan is deliberately centred on ZPD).
 
         `complex_output`: keep the COMPLEX DFT instead of its magnitude, so the
         interferometric phase survives into the saved cube (complex64). Default
@@ -302,7 +251,6 @@ class HyperspectralProcessor:
             datacube = -datacube
 
         _method = str(center_method).lower()
-        per_pixel = _method.startswith("bary")
 
         # Helper for baseline & apodization
         def preprocess(cube, force_center=None, c_pos=None):
@@ -312,29 +260,21 @@ class HyperspectralProcessor:
             window = max(1, len(c_pos) // 5)
             from scipy.ndimage import uniform_filter1d
             # 'nearest' (not constant/0): keeps the baseline sane at the scan
-            # ends instead of inflating the edge samples, which used to drag the
-            # burst detector to index 0.
+            # ends instead of inflating the edge samples.
             baseline = uniform_filter1d(cube, size=window, axis=0, mode='nearest')
             sig = cube - baseline
 
-            # ZPD centre: either forced (reference-shared), one field-wide value
-            # (envelope), or an independent per-pixel barycentre map.
+            # ZPD centre: forced (reference-shared), the geometric midpoint, or an
+            # independent per-pixel I^2 barycentre map (default).
             if force_center is not None:
                 center = force_center
-            elif per_pixel:
-                center = barycenter_map(sig)                 # (h, w) index map
             elif _method.startswith("geom"):
                 # Geometrical centre of the acquired interferogram: the midpoint
                 # sample. Derived from the scan geometry alone -- no burst search,
                 # no dependence on signal quality.
                 center = len(c_pos) // 2
             else:
-                # Collapse to a 1-D interferogram by SIGNED spatial sum (the
-                # common-path fringe phase is shared across the field, so signed
-                # summing reinforces the burst and cancels DC), then take the
-                # analytic-envelope ZPD.
-                interf_1d = np.sum(sig, axis=(1, 2))
-                center = find_centerburst(interf_1d, c_pos, expected_zero_mm, search_mm)
+                center = barycenter_map(sig)                 # (h, w) per-pixel index map
 
             scalar = np.ndim(center) == 0
 

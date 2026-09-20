@@ -7,7 +7,6 @@ suite (github.com/hyperpolimi/hsiAnalysis):
   - svd_denoise            : low-rank spectral denoise (SVD score truncation)
   - peak_wavelength_map    : per-pixel wavelength of the spectral maximum
   - peak_intensity_map     : per-pixel spectral maximum
-  - spectral_derivative    : 1st/2nd derivative along wavelength
   - spectral_angle_map     : SAM distance of every pixel to a reference spectrum
 
 All operate on a real spectral cube of shape (n_freq, h, w) and a 1-D
@@ -62,30 +61,6 @@ def svd_denoise(cube, k):
     return Xk.T.reshape(n_freq, h, w).astype(np.float32)
 
 
-def svd_explained_variance(cube, max_components=50, sample_pixels=8000):
-    """Singular-value spectrum of the (pixels x bands) data, for a scree plot.
-
-    Returns (singular_values, explained_ratio, cumulative_ratio), each truncated
-    to `max_components`. Pixels are subsampled (the singular-value spectrum is
-    well estimated from a subset) and the matrix is mean-centred -- matching
-    svd_denoise -- so the variance fractions correspond to the components
-    svd_denoise keeps.
-    """
-    cube = np.asarray(cube, dtype=np.float32)
-    n_freq, h, w = cube.shape
-    X = cube.reshape(n_freq, h * w).T               # (pixels, bands)
-    if X.shape[0] > sample_pixels:
-        X = X[:: X.shape[0] // sample_pixels]
-    mu = X.mean(axis=0, keepdims=True)
-    sv = np.linalg.svd(X - mu, compute_uv=False)    # descending singular values
-    var = sv.astype(np.float64) ** 2
-    total = var.sum()
-    ev = var / total if total > 0 else var
-    cum = np.cumsum(ev)
-    n = int(min(max_components, len(sv)))
-    return sv[:n], ev[:n], cum[:n]
-
-
 def peak_wavelength_map(cube, wavelengths):
     """(h, w) wavelength (same units as `wavelengths`) of the per-pixel max."""
     cube = np.asarray(cube, dtype=float)
@@ -97,20 +72,6 @@ def peak_wavelength_map(cube, wavelengths):
 def peak_intensity_map(cube):
     """(h, w) per-pixel spectral maximum."""
     return np.max(np.asarray(cube, dtype=float), axis=0)
-
-
-def spectral_derivative(cube, wavelengths, order=1):
-    """d/dλ (order 1) or d²/dλ² (order 2) of the cube along the spectral axis.
-
-    Uses np.gradient (handles the non-uniform wavelength axis) so the output
-    keeps the same shape and wavelength grid. Returns the derivative cube.
-    """
-    cube = np.asarray(cube, dtype=float)
-    wl = np.asarray(wavelengths, dtype=float)
-    d = cube
-    for _ in range(int(order)):
-        d = np.gradient(d, wl, axis=0)
-    return d
 
 
 def continuum_line_image(cube, wavelengths, line, left, right):

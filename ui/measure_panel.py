@@ -14,7 +14,6 @@ window (HyperViewer), like the repo's standalone measurement windows.
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import threading
@@ -51,7 +50,6 @@ def _free_gb(path):
         return None
 
 from instruments.subtwinslv import TwinsScanner
-from instruments.h5_writer import load_measurement_h5
 from instruments.hyperspectral import (
     HyperspectralProcessor, DEFAULT_START_MM, DEFAULT_STOP_MM, DEFAULT_N_STEPS,
     DEFAULT_WL_START, DEFAULT_WL_STOP,
@@ -454,39 +452,6 @@ class LiveInterferogram(QWidget):
         self.curve.setData(self._x, self._y)
 
 
-def load_measurement_npz(path: str):
-    """Read a saved Measurement .npz -> (wavelengths, cubes, z_values, sat_masks).
-
-    Works for files saved by MeasurePanel (spectral cube, optional saturation
-    masks and raw interferogram). Returns None if the spectral cube is absent.
-    """
-    d = np.load(path, allow_pickle=True)
-    if "wavelengths" not in d or "spectrum_cubes" not in d:
-        return None
-    wl = np.asarray(d["wavelengths"])
-    # A cube saved in complex form is displayed as its magnitude.
-    cubes = [np.abs(c) if np.iscomplexobj(c) else np.asarray(c)
-             for c in d["spectrum_cubes"]]
-    zv = d["z_values"] if "z_values" in d else np.full(len(cubes), np.nan)
-    z_values = [None if np.isnan(v) else float(v) for v in np.asarray(zv).ravel()]
-    masks = None
-    if "saturation_masks" in d:
-        masks = [np.asarray(m, bool) for m in d["saturation_masks"]]
-    return wl, cubes, z_values, masks
-
-
-def measurement_metadata(path: str) -> dict:
-    """The embedded metadata dict of a saved Measurement .npz (or {}). Lets a viewer
-    show whether the spectra were computed on the calibrated wedge axis."""
-    try:
-        with np.load(path, allow_pickle=True) as d:
-            if "metadata" in d.files:
-                return dict(d["metadata"].item())
-    except Exception:  # noqa: BLE001
-        pass
-    return {}
-
-
 # ===========================================================================
 # Sidebar controls
 # ===========================================================================
@@ -501,7 +466,7 @@ class MeasurePanel(QWidget):
                  meta_provider=None, save_dir: str = r"C:\temp\measurement") -> None:
         super().__init__()
         self.sp = stages_panel
-        self.frame_source = frame_source
+        self.frame_source = frame_source      # the attribute self.frame_source is storing a function 
         self.roi_provider = roi_provider      # () -> (r0,r1,c0,c1) or None (full frame)
         self.roi_show = roi_show              # (bool) -> toggle the on-image ROI box
         self.bg_provider = bg_provider        # () -> (background_frame|None, subtract_bool)
@@ -541,7 +506,6 @@ class MeasurePanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._build_roi_group())
         layout.addWidget(self._build_scan_group())
         layout.addWidget(self._build_spectrum_group())
         layout.addWidget(self._build_postproc_group())
@@ -568,45 +532,7 @@ class MeasurePanel(QWidget):
         self.sig_warn.connect(self._on_warn)
         self._update_step()
 
-        # Keep the ROI px readout live while the box is dragged.
-        self._roi_timer = QtCore.QTimer(self)
-        self._roi_timer.timeout.connect(self._refresh_roi_label)
-        self._roi_timer.start(700)
-
     # -- groups --------------------------------------------------------------
-    def _build_roi_group(self) -> QGroupBox:
-        g = QGroupBox("ROI + binning")
-        grid = QGridLayout(g)
-        hint = QLabel("Set the ROI on the live view (tick \"Show measurement ROI\" "
-                      "and drag the box). It is saved with the measurement.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(hint, 0, 0, 1, 2)
-
-        self.spin_bin = QSpinBox()
-        self.spin_bin.setRange(1, 64)
-        self.spin_bin.setValue(1)
-        self.spin_bin.setToolTip("Bin NxN pixels into one super-pixel (better SNR, "
-                                 "smaller cube). 1 = no binning.")
-        self.spin_bin.valueChanged.connect(self._refresh_roi_label)
-        grid.addWidget(QLabel("Binning (NxN)"), 1, 0)
-        grid.addWidget(self.spin_bin, 1, 1)
-
-        self.lbl_roi = QLabel("ROI: full frame")
-        self.lbl_roi.setStyleSheet("color:#888; font-size:11px;")
-        grid.addWidget(self.lbl_roi, 2, 0, 1, 2)
-        return g
-
-    def _refresh_roi_label(self) -> None:
-        roi = self.roi_provider() if self.roi_provider else None
-        b = self.spin_bin.value()
-        if roi is None:
-            self.lbl_roi.setText("ROI: full frame")
-        else:
-            r0, r1, c0, c1 = roi
-            h, w = (r1 - r0) // b, (c1 - c0) // b
-            self.lbl_roi.setText(f"ROI: {r1-r0}×{c1-c0} px  →  {h}×{w} after bin {b}")
-
     def _build_scan_group(self) -> QGroupBox:
         g = QGroupBox("TWINS cube scan")
         grid = QGridLayout(g)
@@ -670,17 +596,15 @@ class MeasurePanel(QWidget):
         # Apodization ZPD centre. The WHOLE acquired interferogram is always
         # transformed, so this only sets where the apodization window is centred:
         # an independent I² barycentre per pixel (DEFAULT -- follows a zero-path
-        # position that varies across the field of view), or one field-wide
-        # envelope centre-burst (signed spatial sum). Either way the centre comes
-        # from the acquired data; no expected-ZPD position is assumed.
+        # position that varies across the field of view), or the geometric midpoint
+        # of the scan. The barycentre comes from the acquired data; no expected-ZPD
+        # position is assumed.
         self.combo_center = QComboBox()
-        self.combo_center.addItems(["barycentre (per-pixel)", "envelope (field)",
-                                    "geometric centre"])
+        self.combo_center.addItems(["barycentre (per-pixel)", "geometric centre"])
         self.combo_center.setCurrentText("barycentre (per-pixel)")
         self.combo_center.setToolTip(
             "How the apodization centre (ZPD) is located in the acquired scan:\n"
             "  barycentre (per-pixel) = each pixel's own I² centroid (default)\n"
-            "  envelope (field)       = one centre-burst for the whole frame\n"
             "  geometric centre       = the midpoint sample of the scan, ignoring\n"
             "                           the signal (use when the scan is already\n"
             "                           centred on ZPD)")
@@ -704,11 +628,9 @@ class MeasurePanel(QWidget):
 
     def _center_method(self) -> str:
         """Apodization-centre method for the processor: 'barycenter' (per-pixel,
-        default), 'envelope' (field-wide) or 'geometric' (scan midpoint)."""
-        text = self.combo_center.currentText()
-        if text.startswith("bary"):
-            return "barycenter"
-        return "geometric" if text.startswith("geom") else "envelope"
+        default) or 'geometric' (scan midpoint)."""
+        return "geometric" if self.combo_center.currentText().startswith("geom") \
+            else "barycenter"
 
     def _build_postproc_group(self) -> QGroupBox:
         g = QGroupBox("Post-processing")
@@ -795,17 +717,8 @@ class MeasurePanel(QWidget):
         row.addWidget(self.btn_stop)
         v.addLayout(row)
         row2 = QHBoxLayout()
-        self.btn_recompute = QPushButton("Recompute")
-        self.btn_recompute.clicked.connect(self._recompute)
-        self.btn_recompute.setToolTip("Re-run the DFT on the LAST scan's raw "
-                                      "interferogram with the current settings (apodization "
-                                      "type/width, apod centre, λ window, N freq) -- no re-scan.")
-        self.btn_view = QPushButton("Open Viewer"); self.btn_view.clicked.connect(self._open_viewer)
-        self.btn_load = QPushButton("Load"); self.btn_load.clicked.connect(self._load)
-        self.btn_load.setToolTip("Open a saved Measurement .npz in the viewer.")
         self.btn_save = QPushButton("Save"); self.btn_save.clicked.connect(self._save)
-        row2.addWidget(self.btn_recompute); row2.addWidget(self.btn_view)
-        row2.addWidget(self.btn_load); row2.addWidget(self.btn_save)
+        row2.addWidget(self.btn_save)
         v.addLayout(row2)
         row4 = QHBoxLayout()
         self.edit_filename = QLineEdit("measurement")
@@ -876,7 +789,6 @@ class MeasurePanel(QWidget):
             "ks_stop": (self.spin_stop, float),
             "ks_steps": (self.spin_steps, int),
             "ks_frames": (self.spin_frames, int),
-            "ks_bin": (self.spin_bin, int),
             "ks_wl0": (self.spin_wl0, float),
             "ks_wl1": (self.spin_wl1, float),
             "ks_nfreq": (self.spin_nfreq, int),
@@ -983,8 +895,6 @@ class MeasurePanel(QWidget):
             self.sig_status.emit("No live frame -- start the camera first")
             return
         roi = self.roi_provider() if self.roi_provider else None   # None = full frame
-        self._scan_roi = roi          # saved with the measurement
-        self._scan_bin = self.spin_bin.value()
         if roi is not None:
             r0, r1, c0, c1 = roi
             self.sig_status.emit(f"ROI saved for scan: rows {r0}-{r1}, cols {c0}-{c1}")
@@ -1000,7 +910,7 @@ class MeasurePanel(QWidget):
         params = dict(
             start=self.spin_start.value(), stop=self.spin_stop.value(),
             n=self.spin_steps.value(), frames=self.spin_frames.value(), roi=roi,
-            bin=self.spin_bin.value(),
+            bin=1,   # software binning removed; use the camera's hardware binning
             apod_type=self.combo_apod.currentText(),
             wl0=self.spin_wl0.value(),
             wl1=self.spin_wl1.value(), nfreq=self.spin_nfreq.value(),
@@ -1064,8 +974,6 @@ class MeasurePanel(QWidget):
         self._run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_folder = os.path.join(camera_folder, f"{self._run_stamp}.{self._save_fname}")
         self._save_folder = self._run_folder   # the run's files go here
-        self._cam_meta = (self.meta_provider() or {}) if self.meta_provider else {}
-        self._save_raw_flag = self.chk_save_raw.isChecked()
         self._abort = False
         self._paused = False
         self.raw_cubes, self.raw_positions = [], []
@@ -1113,76 +1021,6 @@ class MeasurePanel(QWidget):
         """Block the worker thread while paused (polling so Stop still aborts)."""
         while self._paused and not self._abort:
             time.sleep(0.1)
-
-    def _recompute(self) -> None:
-        """Re-run the DFT on the last scan's RAW interferogram with the current
-        settings (apodization type/width, apod centre, λ window, N freq) -- no
-        re-scan. Lets you compare e.g. barycentre vs envelope centring on
-        already-acquired data."""
-        if not getattr(self, "raw_cubes", None):
-            self.lbl_status.setText("no raw data to recompute -- run a scan first")
-            return
-        p = dict(
-            wl0=self.spin_wl0.value(), wl1=self.spin_wl1.value(),
-            nfreq=self.spin_nfreq.value(),
-            apod_type=self.combo_apod.currentText(),
-            walkoff=(dict(rate_y=self.spin_wo_y.value(), rate_x=self.spin_wo_x.value())
-                     if self.chk_walkoff.isChecked() else None),
-            sat_on=self.chk_sat.isChecked(), sat_level=self.spin_sat.value(),
-            center_method=self._center_method(),
-            complex_out=self.chk_complex.isChecked(),
-        )
-        # Keep the saved metadata in step with what was recomputed.
-        self._scan_meta.update(
-            ft_region="full",
-            apodization=p["apod_type"],
-            wl_start_um=p["wl0"], wl_stop_um=p["wl1"], n_freq_setting=p["nfreq"],
-            apod_center=p["center_method"],
-            complex_spectrum=p["complex_out"],
-            recomputed=True)
-        self.btn_run.setEnabled(False)
-        self.btn_recompute.setEnabled(False)
-        self.lbl_status.setText(
-            f"recomputing from raw (apod centre: {p['center_method']})...")
-        threading.Thread(target=self._recompute_worker, args=(p,), daemon=True).start()
-
-    def _recompute_worker(self, p: dict) -> None:
-        try:
-            from instruments.analysis import saturation_mask
-            proc = HyperspectralProcessor()
-            cubes, masks, wls = [], [], None
-            complex_cubes = []
-            for positions, datacube in zip(self.raw_positions, self.raw_cubes):
-                datacube = np.asarray(datacube)
-                sat_mask = None
-                if p["sat_on"]:
-                    sat_src = datacube
-                    if self.background_subtracted and self.background_map is not None:
-                        sat_src = datacube + self.background_map[None, :, :]
-                    sat_mask = saturation_mask(sat_src, p["sat_level"])
-                n_freq = resolve_n_points(len(positions), manual=p["nfreq"])
-                wl, cube = proc.compute_hyperspectral(
-                    positions, datacube, wl_start=p["wl0"], wl_stop=p["wl1"],
-                    n_freq=n_freq,
-                    apod_type=p["apod_type"], walkoff=p["walkoff"],
-                    center_method=p["center_method"],
-                    complex_output=p["complex_out"])
-                if cube is None:
-                    continue
-                # Keep the complex cube for saving; everything that DISPLAYS or
-                # averages the cube works on the magnitude, so the viewer, maps
-                # and ROI-average CSV are unaffected by the choice.
-                if p["complex_out"]:
-                    complex_cubes.append(np.asarray(cube, dtype=np.complex64))
-                    cube = np.abs(cube).astype(np.float32)
-                wls = wl
-                cubes.append(cube)
-                masks.append(sat_mask)
-            self.complex_cubes = complex_cubes
-            self.sig_done.emit(wls, cubes, self.z_values, masks)
-        except Exception as e:  # noqa: BLE001
-            self.sig_status.emit(f"recompute error: {e}")
-            self.sig_done.emit(None, None, None, None)
 
     def _position_calibration(self, positions):
         """(calibrated_axis, info) for a raw measured wedge axis -- the SAME
@@ -1337,7 +1175,6 @@ class MeasurePanel(QWidget):
     @QtCore.pyqtSlot(object, object, object, object)
     def _on_done(self, wavelengths, cubes, z_values, sat_masks) -> None:
         self.btn_run.setEnabled(True)
-        self.btn_recompute.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("Pause")
         self._paused = False
@@ -1634,61 +1471,6 @@ class MeasurePanel(QWidget):
             self.lbl_status.setText(f"saved {saved} to {folder}")
         except Exception as e:  # noqa: BLE001
             self.lbl_status.setText(f"save error: {e}")
-
-    def _load(self) -> None:
-        folder = self._save_dir()
-        start = folder if os.path.isdir(folder) else ""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Measurement measurement", start,
-            "Measurements (*.npz *.h5);;NumPy archive (*.npz);;HDF5 (*.h5)")
-        if not path:
-            return
-        try:
-            if path.lower().endswith(".h5"):
-                # New two-file layout (Hyperspectrum_cube) first, then the older
-                # ScopeFoundry layout for files saved before this change.
-                res = self._load_spectral_hdf5(path) or load_measurement_h5(path)
-            else:
-                res = load_measurement_npz(path)
-            if res is None:
-                self.lbl_status.setText("file has no spectral cube")
-                return
-            wl, cubes, z_values, masks = res
-            self.wavelengths, self.cubes, self.z_values = wl, cubes, z_values
-            self.sat_masks = masks or [None] * len(cubes)
-            self.raw_cubes, self.raw_positions = [], []  # not reloaded for viewing
-            self.complex_cubes = []
-            self.lbl_status.setText(
-                f"loaded {os.path.basename(path)}: {len(cubes)} map(s), cube {cubes[0].shape}")
-            self._open_viewer()
-        except Exception as e:  # noqa: BLE001
-            self.lbl_status.setText(f"load error: {e}")
-
-    def _load_spectral_hdf5(self, path: str):
-        """Read a `_SpectralHypercube.h5` written by _save_matlab_files back into
-        the viewer form (wl_um, [cube], [None], [None]). Returns None if the file
-        is not that layout, so the caller can try the older reader."""
-        try:
-            import h5py
-        except Exception:  # noqa: BLE001
-            return None
-        try:
-            with h5py.File(path, "r") as f:
-                g = f.get("SpectralHypercube")
-                if g is None or "Hyperspectrum_cube" not in g or "fr_real" not in g:
-                    return None
-                cube = np.asarray(g["Hyperspectrum_cube"])       # (slices, y, x)
-                fr_real = np.asarray(g["fr_real"]).reshape(-1)   # THz
-        except Exception:  # noqa: BLE001
-            return None
-        n = int(fr_real.size)
-        # Complex was saved as a real stack of 2*n_freq slices (real then imag);
-        # rebuild the magnitude for the viewer. Otherwise it is already magnitude.
-        if cube.shape[0] == 2 * n:
-            cube = np.abs(cube[:n] + 1j * cube[n:])
-        cube = np.ascontiguousarray(cube, dtype=np.float32)      # (n_freq, y, x)
-        wl_um = self._C_UM_THZ / fr_real                         # THz -> um
-        return wl_um, [cube], [None], [None]
 
     def shutdown(self) -> None:
         # Abort a running acquisition and wait for its worker thread to unwind

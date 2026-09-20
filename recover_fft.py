@@ -22,8 +22,7 @@ from datetime import datetime
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from instruments.hyperspectral import (HyperspectralProcessor, resolve_n_points,
-                                       DEFAULT_ZPD_MM, DEFAULT_ZPD_WINDOW_MM)
+from instruments.hyperspectral import HyperspectralProcessor, resolve_n_points
 from instruments.analysis import saturation_mask, svd_denoise
 
 
@@ -79,7 +78,6 @@ def recover_file(path, dest_dir, proc):
     wl, cube = proc.compute_hyperspectral(
         positions, datacube, wl_start=wl0, wl_stop=wl1,
         n_freq=n_freq,
-        expected_zero_mm=DEFAULT_ZPD_MM, search_mm=DEFAULT_ZPD_WINDOW_MM,
         apod_type=apod_type, walkoff=walkoff,
         ft_region=ft_region, ft_width_mm=ft_width)
     if cube is None:

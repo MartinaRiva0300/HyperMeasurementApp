@@ -8,9 +8,7 @@ from multiprocessing import shared_memory
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QRect, QSize
-from PyQt6.QtGui import QPainter, QPdfWriter
-from PyQt6.QtSvg import QSvgGenerator
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,7 +22,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLineEdit,
     QScrollArea,
-    QSlider,
     QSplitter,
     QTabWidget,
     QSpinBox,
@@ -32,7 +29,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ui.stages import StagesPanel
+from ui.stage import StagesPanel
 from ui.twins_scan import TwinsScanPanel
 from ui.measure_panel import MeasurePanel
 
@@ -281,6 +278,28 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Camera")
         layout = QVBoxLayout(group)
 
+        # Camera controls
+        connect_button = QPushButton("Connect / Reconnect")
+        connect_button.clicked.connect(self.connect_selected_mode)
+        disconnect_button = QPushButton("Disconnect")
+        disconnect_button.setToolTip(
+            "Stop the stream and release the camera, staying offline (no "
+            "auto-reconnect). Use this if the image splits / shows wrong pixels "
+            "(GigE stream desync), then click Connect / Reconnect to recover.")
+        disconnect_button.clicked.connect(self.disconnect_camera)
+        start_button = QPushButton("Start")
+        start_button.clicked.connect(lambda: self.control_queue.put({"type": "start"}))
+        pause_button = QPushButton("Pause")
+        pause_button.clicked.connect(lambda: self.control_queue.put({"type": "pause"}))
+        conn_row = QHBoxLayout()
+        conn_row.addWidget(connect_button)
+        conn_row.addWidget(disconnect_button)
+        run_row = QHBoxLayout()
+        run_row.addWidget(start_button)
+        run_row.addWidget(pause_button)
+        layout.addLayout(conn_row)
+        layout.addLayout(run_row)
+
         self.backend_label = QLabel("Backend: unknown")
         self.mode_label = QLabel("Requested mode: -")
         self.resolution_label = QLabel("Resolution: -")
@@ -291,30 +310,29 @@ class MainWindow(QMainWindow):
                    self.serial_label, self.average_label, self.exposure_status_label):
             layout.addWidget(_w)
 
+        # Connection mode: Forge SWIR (Spinnaker/PySpin) or Mock (synthetic frames).
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["forge", "mock", "auto"])
+        self.mode_combo.addItems(["forge", "mock"])
         self.mode_combo.setCurrentText(self.current_mode)
         layout.addWidget(QLabel("Connection mode"))
         layout.addWidget(self.mode_combo)
 
-        # Integration time. LOG-scale slider spanning the full range (1 us .. 1 s)
-        # so both very short and long integrations are reachable; the spin box
-        # gives exact entry. The backend clamps to what the camera accepts.
+        # Integration time: type the exact value in the spin box. Range defaults
+        # to 1 µs .. 1 s and is replaced with the camera's real limits once it
+        # connects (see _apply_exposure_limits). The backend also clamps to what
+        # the camera accepts.
         self.INT_MIN_MS, self.INT_MAX_MS = 0.001, 1000.0
-        self.integration_label = QLabel("Integration time: 0.30 ms")
-        self.integration_slider = QSlider(Qt.Orientation.Horizontal)
-        self.integration_slider.setRange(0, 1000)   # log-mapped to INT_MIN..MAX ms
-        self.integration_slider.valueChanged.connect(self.on_integration_slider_changed)
         self.integration_spin = QDoubleSpinBox()
         self.integration_spin.setDecimals(3)
         self.integration_spin.setRange(self.INT_MIN_MS, self.INT_MAX_MS)
         self.integration_spin.setSingleStep(0.05)
+        self.integration_spin.setSuffix(" ms")
         self.integration_spin.valueChanged.connect(self.on_integration_spin_changed)
-        layout.addWidget(self.integration_label)
-        layout.addWidget(self.integration_slider)
+        layout.addWidget(QLabel("Integration time"))
         layout.addWidget(self.integration_spin)
-        self._set_integration_value(0.3, emit=False)   # sync both widgets
+        self._set_integration_value(0.3, emit=False)
 
+        # Averaging: the backend averages N frames before sending to the GUI.
         self.average_spin = QSpinBox()
         self.average_spin.setRange(1, 256)
         self.average_spin.setValue(1)
@@ -379,6 +397,7 @@ class MainWindow(QMainWindow):
         rev_row.addStretch()
         layout.addLayout(rev_row)
 
+        # Software binning: NxN, horizontal and vertical are kept equal (camera supports independent H/V binning, but we choose to keep it square).
         bin_row = QHBoxLayout()
         bin_row.addWidget(QLabel("Software binning"))
         self.binning_combo = QComboBox()
@@ -393,43 +412,21 @@ class MainWindow(QMainWindow):
         bin_row.addWidget(self.binning_combo)
         layout.addLayout(bin_row)
 
+        # Frame rate is READ-ONLY: the camera's resulting achievable rate at the
+        # current exposure/ROI/binning (AcquisitionResultingFrameRate), updated
+        # from status. It is not user-settable (the camera free-runs at this rate).
+        # The Acquisition Frame Rate can be manually controlled with AcquisitionFrameRateEnable 
+        # and AcquisitionFrameRate to specify a frame rate. 
         fr_row = QHBoxLayout()
         fr_row.addWidget(QLabel("Frame rate (Hz)"))
-        self.framerate_spin = QDoubleSpinBox()
-        # 1 GigE caps the full-frame rate at roughly 42 Hz (1280x1024, Mono16);
-        # the camera clamps anything higher to what the link can carry.
-        self.framerate_spin.setRange(0.03, 100.0)
-        self.framerate_spin.setDecimals(2)
-        self.framerate_spin.setValue(30.0)
-        self.framerate_spin.valueChanged.connect(
-            lambda v: self.control_queue.put(
-                {"type": "set_option", "name": "AcquisitionFrameRate", "value": float(v)}))
-        fr_row.addWidget(self.framerate_spin)
+        self.framerate_value = QLabel("--")
+        self.framerate_value.setStyleSheet("font-weight:600;")
+        self.framerate_value.setToolTip(
+            "Resulting frame rate the camera can deliver at the current exposure, "
+            "ROI and binning (read-only; AcquisitionResultingFrameRate).")
+        fr_row.addWidget(self.framerate_value)
+        fr_row.addStretch()
         layout.addLayout(fr_row)
-
-        start_button = QPushButton("Start")
-        start_button.clicked.connect(lambda: self.control_queue.put({"type": "start"}))
-        pause_button = QPushButton("Pause")
-        pause_button.clicked.connect(lambda: self.control_queue.put({"type": "pause"}))
-        snapshot_button = QPushButton("Snapshot")
-        snapshot_button.clicked.connect(lambda: self.control_queue.put({"type": "snapshot"}))
-        connect_button = QPushButton("Connect / Reconnect")
-        connect_button.clicked.connect(self.connect_selected_mode)
-        disconnect_button = QPushButton("Disconnect")
-        disconnect_button.setToolTip(
-            "Stop the stream and release the camera, staying offline (no "
-            "auto-reconnect). Use this if the image splits / shows wrong pixels "
-            "(GigE stream desync), then click Connect / Reconnect to recover.")
-        disconnect_button.clicked.connect(self.disconnect_camera)
-        top_buttons = QHBoxLayout()
-        top_buttons.addWidget(connect_button)
-        top_buttons.addWidget(start_button)
-        bottom_buttons = QHBoxLayout()
-        bottom_buttons.addWidget(disconnect_button)
-        bottom_buttons.addWidget(pause_button)
-        bottom_buttons.addWidget(snapshot_button)
-        layout.addLayout(top_buttons)
-        layout.addLayout(bottom_buttons)
 
         return group
 
@@ -497,14 +494,6 @@ class MainWindow(QMainWindow):
         # initial enabled state matches auto toggle (auto starts off -> manual on)
         self.display_min_spin.setEnabled(not self.auto_scale_display)
         self.display_max_spin.setEnabled(not self.auto_scale_display)
-
-        save_svg_button = QPushButton("Save snapshot as SVG")
-        save_svg_button.clicked.connect(self.save_snapshot_svg)
-        layout.addWidget(save_svg_button)
-
-        save_pdf_button = QPushButton("Save snapshot as PDF")
-        save_pdf_button.clicked.connect(self.save_snapshot_pdf)
-        layout.addWidget(save_pdf_button)
 
         return group
 
@@ -600,17 +589,9 @@ class MainWindow(QMainWindow):
         else:
             self.save_status_label.setText("Save FAILED (see console)")
 
-    def _ms_to_slider(self, ms: float) -> int:
-        ms = float(np.clip(ms, self.INT_MIN_MS, self.INT_MAX_MS))
-        frac = np.log10(ms / self.INT_MIN_MS) / np.log10(self.INT_MAX_MS / self.INT_MIN_MS)
-        return int(round(frac * 1000.0))
-
-    def _slider_to_ms(self, s: int) -> float:
-        return float(self.INT_MIN_MS * (self.INT_MAX_MS / self.INT_MIN_MS) ** (s / 1000.0))
-
     def _apply_exposure_limits(self, lo_ms, hi_ms) -> None:
-        """Adopt the camera's hardware exposure range for the slider/spin. No-op
-        unless it actually changed (avoids reformatting the widgets every frame)."""
+        """Adopt the camera's hardware exposure range for the spin box. No-op
+        unless it actually changed (avoids reformatting the widget every frame)."""
         try:
             lo = float(lo_ms)
             hi = float(hi_ms)
@@ -669,24 +650,12 @@ class MainWindow(QMainWindow):
 
     def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
         integration_ms = float(np.clip(integration_ms, self.INT_MIN_MS, self.INT_MAX_MS))
-        self.integration_label.setText(f"Integration time: {integration_ms:.3f} ms")
-
-        slider_value = self._ms_to_slider(integration_ms)
-        if self.integration_slider.value() != slider_value:
-            self.integration_slider.blockSignals(True)
-            self.integration_slider.setValue(slider_value)
-            self.integration_slider.blockSignals(False)
-
         if abs(self.integration_spin.value() - integration_ms) > 1e-6:
             self.integration_spin.blockSignals(True)
             self.integration_spin.setValue(integration_ms)
             self.integration_spin.blockSignals(False)
-
         if emit:
             self.control_queue.put({"type": "set_exposure", "value": integration_ms})
-
-    def on_integration_slider_changed(self, value: int) -> None:
-        self._set_integration_value(self._slider_to_ms(value), emit=True)
 
     def on_integration_spin_changed(self, value: float) -> None:
         self._set_integration_value(value, emit=True)
@@ -910,53 +879,6 @@ class MainWindow(QMainWindow):
         self.image_item.setColorMap(self.color_map)
         self.color_bar.setColorMap(self.color_map)
 
-    def _render_export_panel(self, painter: QPainter) -> None:
-        self.export_panel.render(painter)
-
-    def save_snapshot_svg(self) -> None:
-        if self.latest_frame is None:
-            QMessageBox.information(self, "No data", "No frame is available yet.")
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save SVG Snapshot",
-            "wincam_snapshot.svg",
-            "SVG files (*.svg)",
-        )
-        if not path:
-            return
-
-        generator = QSvgGenerator()
-        generator.setFileName(path)
-        size = self.export_panel.size()
-        generator.setSize(QSize(max(size.width(), 1), max(size.height(), 1)))
-        generator.setViewBox(QRect(0, 0, max(size.width(), 1), max(size.height(), 1)))
-        generator.setTitle("WinCamD snapshot")
-        painter = QPainter(generator)
-        self._render_export_panel(painter)
-        painter.end()
-
-    def save_snapshot_pdf(self) -> None:
-        if self.latest_frame is None:
-            QMessageBox.information(self, "No data", "No frame is available yet.")
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save PDF Snapshot",
-            "wincam_snapshot.pdf",
-            "PDF files (*.pdf)",
-        )
-        if not path:
-            return
-
-        writer = QPdfWriter(path)
-        writer.setResolution(300)
-        painter = QPainter(writer)
-        self._render_export_panel(painter)
-        painter.end()
-
     def update_from_worker(self) -> None:
         latest_frame_packet = None
         try:
@@ -1036,6 +958,11 @@ class MainWindow(QMainWindow):
         self._apply_exposure_limits(status.get("exposure_min_ms"),
                                     status.get("exposure_max_ms"))
         self._set_integration_value(exposure_ms, emit=False)
+
+        # Read-only resulting frame rate (updates with exposure/ROI/binning).
+        fr = status.get("frame_rate_hz")
+        self.framerate_value.setText(
+            f"{fr:.2f}" if isinstance(fr, (int, float)) and fr == fr else "--")
 
         # Populate the drop-down with the factors the camera supports and select
         # the one actually applied -- without re-triggering a set_binning command.

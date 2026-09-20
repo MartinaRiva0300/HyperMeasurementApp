@@ -160,7 +160,7 @@ display range are display-only (don't touch the camera).
 
 ---
 
-## 4. Stage (`ui/stages.py`, `instruments/twins_stage.py`)
+## 4. Stage (`ui/stage.py`, `instruments/twins_stage.py`)
 
 `StagesPanel` owns the one driver and exposes a single QGroupBox (`twins_group`, placed in
 the TWINS tab). It runs a 500 ms position-poll timer and wraps blocking moves in a
@@ -289,12 +289,12 @@ the primary dataset, a cube with no raw data (one loaded from an old file) canno
 written as HDF5; `_save_cube_h5` raises and `_save` surfaces it.
 
 ### Viewer
-`HyperViewer` (in-app "Open Viewer" + standalone `view_hyperspectral.py`) shows the cube:
-λ slider (the Z slider stays hidden — there is no Z axis), maps
-(λ-slice/Peak-λ/Peak-intensity/SAM), colormap/gamma, pixel spectra,
-and a calibration badge via `set_calibration_note(meta)`. `set_result` (in-RAM) /
-`set_result_lazy` (per-Z lazy load). Full analysis is done in external tools that
-read the saved HDF5 files.
+`HyperViewer` opens **automatically at the end of a measurement** (no manual
+"Open Viewer"/"Load"/"Recompute" buttons) to show the cube: λ slider (the Z slider
+stays hidden — there is no Z axis), maps (λ-slice/Peak-λ/Peak-intensity),
+colormap/gamma, pixel spectra, and a calibration badge via
+`set_calibration_note(meta)` (`set_result`, in-RAM). Full analysis is done in
+external tools that read the saved HDF5 files.
 
 ### Metadata captured at scan start (`_scan_meta` + `_cam_meta`)
 start/stop/steps/step_um, frames/point, binning, ROI, apodization+width, wl range,
@@ -367,7 +367,7 @@ board temp, backend).
 | `worker_camera.py` | camera worker process: frame/status out, command in, auto-heal |
 | `camera/{camera_interface,factory,forge_camera,mock_camera}.py` | camera abstraction + backends |
 | `ui/main_window.py` | orchestrator: frame poll, latest_frame, controls, bad-pixel mask, save, metadata |
-| `ui/stages.py` | StagesPanel: TWINS wedge UI, StageController threading, freeze() |
+| `ui/stage.py` | StagesPanel: TWINS wedge UI, StageController threading, freeze() |
 | `ui/twins_scan.py` | live 1-D TWINS scan UI |
 | `ui/measure_panel.py` | **MeasurePanel**: the hyperspectral experiment + HyperViewer |
 | `instruments/twins_stage.py` | SmarAct MCS2 driver for the SLC-1750 wedge stage |

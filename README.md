@@ -24,7 +24,7 @@ cube.
 - Live image with Inferno / Viridis / Magma / Grey / Turbo / Coolwarm colormaps.
 - Auto or fixed Min/Max colorbar; click a pixel for horizontal/vertical profiles.
 - Exposure 0.001–1000 ms, software frame averaging, background capture /
-  subtraction, snapshot, camera temperature readout.
+  subtraction, camera temperature readout.
 - Forge GenICam options exposed directly: `ExposureAuto`, `PixelFormat`,
   `AdcBitDepth`, manual `Gain`, `ReverseX`/`ReverseY`. The frame rate is shown
   **read-only** (`AcquisitionResultingFrameRate`) — the camera free-runs at the
@@ -70,6 +70,31 @@ cube.
 
 ## Save formats
 
+**TWINS panel**
+The **Save** button in the Spectrum subpanel writes one `.h5` file into a `twins`
+folder created inside the directory set in the main (camera) panel (default
+`C:\temp\`). It holds the live 1-D scan: the ROI-averaged interferogram, its wedge
+axis, and — when a spectrum has been computed — the spectrum and its wavelength
+axis. Positions here are in **millimetres** (the Measure-panel files use µm).
+
+**`<run-stamp>_twins_scan.h5`** (`<run-stamp>` = `YYYYMMDD_HHMMSS`):
+```
+/positions        the wedge axis actually used: the motor-corrected positions
+                  when the correction file (parameters_int.txt) is loaded, else
+                  the raw measured positions. float64, MILLIMETRES.
+                  attrs: units="mm", axis="calibrated"|"raw_measured",
+                  calibration_file (present when a calibration file was found)
+/positions_raw    the raw non-corrected positions (mm), written ONLY when the
+                  correction file is loaded (else /positions already IS the raw axis)
+/interferogram    the 1-D interferogram — ROI-mean intensity per wedge step, (n_pos,)
+/wavelengths      wavelength axis of the computed spectrum (µm); written only if a
+                  spectrum was computed after the scan
+/spectrum         the computed spectrum magnitude |FT|; written only if a spectrum
+                  was computed after the scan
+```
+Root attribute `roi = [r0, r1, c0, c1]` is written when the scan used an ROI.
+
+**Measure panel**
 Every run writes **two HDF5 files** into its run folder, in the layout the lab's
 pre-existing MATLAB analysis codes expect. Spatial axes come first in both cubes.
 HDF5 is the only format (it needs `h5py`; saving reports a clear error without
@@ -123,10 +148,10 @@ scan/spectrum settings are recorded once, in the temporal file's
 ## Layout
 
 ```
-main.py               entry point  (--mode forge|mock|auto, --fps N)
+main.py               entry point  (--mode forge|mock, --fps N)
 worker_camera.py      camera worker process (frames -> shared memory + queue)
 camera/               camera abstraction + backends
-  camera_interface.py   CameraInterface ABC + CameraStatus/MeasurementResult
+  camera_interface.py   CameraInterface ABC + CameraStatus
   forge_camera.py       Forge 1GigE SWIR backend (Spinnaker / PySpin)
   mock_camera.py        synthetic drifting-beam camera (no hardware)
   factory.py            create_camera(mode)
@@ -140,7 +165,7 @@ instruments/          drivers + shared DSP
   subtwinslv.py         step-scan engine (scan / scan_cube)
   hyperspectral.py      2-D per-pixel DFT (compute_hyperspectral)
   spectrum_processor.py 1-D interferogram -> spectrum
-  h5_writer.py          ScopeFoundry-layout HDF5 save/load
+  h5_writer.py          HDF5 helpers (_require_h5py, _set_attrs)
   calibration.py dsp.py analysis.py   shared processing
 Twins/calibration/      parameters_{cal,int}.txt  spectral + motor calibration
 selftest_acquisition.py  headless mock-camera + simulated-stage acquisition test

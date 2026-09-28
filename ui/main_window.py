@@ -327,6 +327,10 @@ class MainWindow(QMainWindow):
         self.integration_spin.setRange(self.INT_MIN_MS, self.INT_MAX_MS)
         self.integration_spin.setSingleStep(0.05)
         self.integration_spin.setSuffix(" ms")
+        # Only emit valueChanged when editing is finished (Enter / focus-out), not
+        # on every keystroke -- otherwise partial numbers get sent to the camera and
+        # its snapped read-back overwrites the box mid-typing.
+        self.integration_spin.setKeyboardTracking(False)
         self.integration_spin.valueChanged.connect(self.on_integration_spin_changed)
         layout.addWidget(QLabel("Integration time"))
         layout.addWidget(self.integration_spin)
@@ -562,12 +566,12 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             print(f"[save] TIFF failed: {e}")
 
-        # Raw NumPy (for analysis)
-        try:
-            np.save(os.path.join(save_dir, base + ".npy"), raw)
-            saved.append(base + ".npy")
-        except Exception as e:  # noqa: BLE001
-            print(f"[save] npy failed: {e}")
+        # # Raw NumPy (for analysis)
+        # try:
+        #     np.save(os.path.join(save_dir, base + ".npy"), raw)
+        #     saved.append(base + ".npy")
+        # except Exception as e:  # noqa: BLE001
+        #     print(f"[save] npy failed: {e}")
 
         # Colormapped PNG matching the current display (levels + colormap)
         try:
@@ -650,10 +654,9 @@ class MainWindow(QMainWindow):
 
     def _set_integration_value(self, integration_ms: float, *, emit: bool) -> None:
         integration_ms = float(np.clip(integration_ms, self.INT_MIN_MS, self.INT_MAX_MS))
-        if abs(self.integration_spin.value() - integration_ms) > 1e-6:
-            self.integration_spin.blockSignals(True)
-            self.integration_spin.setValue(integration_ms)
-            self.integration_spin.blockSignals(False)
+        self.integration_spin.blockSignals(True)
+        self.integration_spin.setValue(integration_ms)
+        self.integration_spin.blockSignals(False)
         if emit:
             self.control_queue.put({"type": "set_exposure", "value": integration_ms})
 

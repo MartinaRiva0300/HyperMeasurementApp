@@ -290,6 +290,7 @@ class ForgeSwirCamera(CameraInterface):
             self.status.exposure_ms = actual
             self._refresh_frame_rate()   # exposure changes the resulting rate
             self.status.message = f"Exposure {actual:.3f} ms"
+            logger.info(f"[forge] {self.status.message}")
         except Exception as e:  # noqa: BLE001
             self.status.message = f"set_exposure failed: {e}"
             logger.warning(self.status.message)

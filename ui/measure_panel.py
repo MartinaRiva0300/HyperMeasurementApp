@@ -657,10 +657,6 @@ class MeasurePanel(QWidget):
         row.addWidget(self.btn_run); row.addWidget(self.btn_pause)
         row.addWidget(self.btn_stop)
         v.addLayout(row)
-        row2 = QHBoxLayout()
-        self.btn_save = QPushButton("Save"); self.btn_save.clicked.connect(self._save)
-        row2.addWidget(self.btn_save)
-        v.addLayout(row2)
         row4 = QHBoxLayout()
         self.edit_filename = QLineEdit("measurement")
         self.edit_filename.setToolTip("Base filename; files are saved as "
@@ -1377,20 +1373,6 @@ class MeasurePanel(QWidget):
                 stem, cube0, f_axis, fr_real, satmap, spectral_cal_path))
 
         return written
-
-    def _save(self) -> None:
-        if not self.cubes:
-            self.lbl_status.setText("nothing to save")
-            return
-        # Save into the run folder (<run-stamp>.<filename>/) so all of this
-        # experiment's files stay together.
-        try:
-            folder, stamp, fname = self._run_target()
-            stem = os.path.join(folder, f"{stamp}.{fname}")
-            saved = os.path.basename(self._save_cube(stem))
-            self.lbl_status.setText(f"saved {saved} to {folder}")
-        except Exception as e:  # noqa: BLE001
-            self.lbl_status.setText(f"save error: {e}")
 
     def shutdown(self) -> None:
         # Abort a running acquisition and wait for its worker thread to unwind

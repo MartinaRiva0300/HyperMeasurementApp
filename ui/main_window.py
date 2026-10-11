@@ -124,7 +124,7 @@ class MainWindow(QMainWindow):
         self._live_active = False
         self._meas_active = False
 
-        self.setWindowTitle("Hyperspectral Control")
+        self.setWindowTitle("Hyperspectral Control — Retiga E7 + PI")
         self.resize(1500, 900)
         self.setStyleSheet(STYLESHEET)
 

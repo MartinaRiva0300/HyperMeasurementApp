@@ -252,6 +252,12 @@ class LiveViewPanel(QWidget):
         if was_running:
             self.live_stopped.emit()
 
+    def restart_live(self):
+        """Stop and start the live worker (PVCAM latches exp_time at start_live)."""
+        if self._live_worker and self._live_worker.isRunning():
+            self.stop_live()
+            self.start_live()
+
     @pyqtSlot(np.ndarray)
     def _on_new_frame(self, frame: np.ndarray):
         self.display_frame(frame)

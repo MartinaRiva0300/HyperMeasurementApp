@@ -1,17 +1,19 @@
-# Hyperspectral Control App — Python dependencies
+# Hyperspectral Control App (Retiga E7 + PI) — Python dependencies
 #
-# Install into your environment (e.g. the `scopefoundry` conda env):
+# Install into your environment (e.g. the `retigaE7` / `scopefoundry` conda env):
 #     pip install -r requirements.txt
 #
 # Hardware drivers required separately on Windows:
-#   - Hamamatsu DCAM4 SDK (for CameraDevice.py / Orca Flash 4V3)
-#   - PI GCS / pipython USB drivers (for PI_VC_device.py)
+#   - Teledyne Photometrics PVCAM + PVCAM SDK, and the PyVCAM wrapper
+#     (https://github.com/Photometrics/PyVCAM: `pip install .` in its folder)
+#     used by Teledyne_ScopeFoundry/CameraDevice.py (Retiga E7)
+#   - PI GCS / pipython USB drivers (for PI_ScopeFoundry/PI_VC_device.py)
 
 PyQt5>=5.15
 numpy>=1.21
 pyqtgraph>=0.12
 h5py>=3.0
 
-# PI Python wrapper — only needed for the real stage (already vendored in
-# ScopeFoundry Projects/PI_ScopeFoundry/PIPython). Uncomment if not installed:
-# pipython
+# Camera / stage Python wrappers — only needed for --real. Uncomment if not installed:
+# pyvcam
+# pipython   (also vendored in ScopeFoundry Projects/PI_ScopeFoundry/PIPython)

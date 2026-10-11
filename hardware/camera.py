@@ -1,41 +1,37 @@
 """
-Hamamatsu Orca Flash camera wrapper.
+Teledyne Retiga E7 camera wrapper (PVCAM via PyVCAM).
 
-Thin wrapper around HamamatsuDevice (CameraDevice.py) that exposes the SAME
-set of device functions used by your existing CameraHardware.py /
-hyperspectral_measure.py, behind a clean open/close API the rest of the app
-shares. Nothing here changes camera behaviour — every call forwards 1:1 to
-the matching HamamatsuDevice method.
+Thin wrapper around PVcamDevice (Teledyne_ScopeFoundry/CameraDevice.py) that
+exposes the SAME device functions used by CameraHW.py / hyperspectral_measure.py
+(RetigaE7_PI branch), behind a clean open/close API the rest of the app shares.
+Every call forwards 1:1 to the matching PVcamDevice method; nothing here changes
+camera behaviour.
 
-Device methods forwarded (see CameraDevice.py):
-    setExposure / getExposure
-    setBinning / getBinning
-    setSubarrayH / setSubarrayV / setSubarrayHpos / setSubarrayVpos /
-        setSubArrayMode / getSubarray*           (ROI)
-    setTriggerSource / setTriggerMode / setTriggerPolarity / setTriggerActive
-    getInternalFrameRate / getTemperature / getModelInfo
-    startAcquisition / stopAcquisition / stopAcquisitionNotReleasing
-    getLastFrame / getFrames
+Device methods forwarded (see Teledyne_ScopeFoundry/CameraDevice.py):
+    set_exposure / get_exposure            (integer milliseconds)
+    set_binning / get_binning              (1 / 2 / 4, square)
+    set_roi / getSubarray*                 (h0, v0, width, height in sensor px)
+    set_readout / get_readout              (0 Speed, 1 Long Exposure, 2 Long Exposure EDR)
+    set_gain / get_gain                    (1 Full Well, 2 Sensitivity; only 1 for readout 0)
+    set_trigger_mode / get_trigger_mode    ('Internal Trigger', 'Edge Trigger', ...)
+    get_temperature / get_temperature_setpoint / get_idname / get_width / get_height
+    acq_start            -> cam.start_live()   (circular buffer, 16 frames)
+    acq_start_seq(n)     -> cam.start_seq(n)   (non-circular, n frames)
+    get_nparray          -> cam.poll_frame()['pixel_data']
+    acq_stop             -> cam.finish()
+
+The only direct PyVCAM calls that bypass PVcamDevice are poll_frame(timeout_ms)
+and abort(): PVcamDevice.get_nparray waits forever, which would hang a scan
+thread on a missed hardware trigger. They are the same underlying calls.
 """
+
+from __future__ import annotations
 
 import sys
 import os
 import time
-import contextlib
 import numpy as np
 
-
-@contextlib.contextmanager
-def _suppress_stdout():
-    """Silence prints from the device layer (e.g. CameraDevice.stopAcquisition's
-    'max camera backlog ...' line) without editing the shared CameraDevice.py."""
-    old = sys.stdout
-    try:
-        sys.stdout = open(os.devnull, 'w')
-        yield
-    finally:
-        sys.stdout.close()
-        sys.stdout = old
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in [_HERE, os.path.join(_HERE, '..')]:
@@ -47,7 +43,7 @@ def add_path(path):
     """Add a folder under the 'ScopeFoundry Projects' root to sys.path.
 
     This file is at  <ScopeFoundry Projects>/HyperMeasurementApp/hardware/camera.py
-    so the projects root is three levels up; `path` (e.g. 'Hamamatsu_ScopeFoundry')
+    so the projects root is three levels up; `path` (e.g. 'Teledyne_ScopeFoundry')
     is a sibling of HyperMeasurementApp.
     """
     here = os.path.abspath(__file__)
@@ -59,48 +55,80 @@ def add_path(path):
         sys.path.append(target)
 
 
-class HamamatsuCamera:
-    """
-    Wrapper around HamamatsuDevice.
+# PVCAM exposure (trigger) modes exposed by CameraHW.py, in the same order.
+TRIGGER_MODES = ['Internal Trigger', 'Edge Trigger', 'Trigger First',
+                 'Software Trigger Edge', 'Software Trigger First']
 
-    The wrapper keeps a small amount of cached state (exposure, binning, ROI)
-    so the UI can show values before the camera is opened; once opened, every
-    getter reads back from the hardware.
+# Readout ports of the Retiga E7 (CameraDevice.py): index -> label.
+READOUT_PORTS = {0: 'Speed', 1: 'Long Exposure', 2: 'Long Exposure EDR'}
+
+# Gain indices (CameraHW.py): 1 Full Well, 2 Sensitivity (readout 1 and 2 only).
+GAINS = {1: 'Full Well', 2: 'Sensitivity'}
+
+# Retiga E7 sensor, sensor pixels (width, height).
+SENSOR_W, SENSOR_H = 3200, 2200
+
+# Readout time vs ROI, from hyperspectral_measure.set_motor_velocity (RetigaE7_PI):
+#   readout_s = 1 / (a / (H - b) + c)    for ROI width W in (lo, hi]
+_READOUT_FIT = [
+    (2900, 3200, 1.029e+05, -35.78, -4.887),
+    (2600, 2900, 1.089e+05, -42.89, -0.969),
+    (0,    2600, 1.085e+05, -43.19,  4.604),
+]
+
+
+def readout_time_s(roi_width: int, roi_height: int) -> float:
+    """Empirical Retiga E7 readout time (s) for the given ROI, as in set_motor_velocity."""
+    W, H = int(roi_width), int(roi_height)
+    a, b, c = _READOUT_FIT[0][2:]
+    for lo, hi, fa, fb, fc in _READOUT_FIT:
+        if lo < W <= hi:
+            a, b, c = fa, fb, fc
+            break
+    denom = a / max(H - b, 1e-6) + c
+    return 1.0 / denom if denom > 0 else 0.0
+
+
+def max_frame_rate_hz(roi_width: int, roi_height: int, exposure_s: float) -> float:
+    """Maximum internal-trigger frame rate (Hz) for the ROI + exposure (set_motor_velocity)."""
+    t = exposure_s + readout_time_s(roi_width, roi_height)
+    return 1.0 / t if t > 0 else 0.0
+
+
+class RetigaCamera:
+    """
+    Wrapper around PVcamDevice (Teledyne Retiga E7).
+
+    Keeps a small amount of cached state (exposure, binning, ROI, readout, gain,
+    trigger mode) so the UI can show values before the camera is opened; once
+    opened the cached values are pushed to the device and every getter reads
+    back from the hardware.
     """
 
     def __init__(self,
-                 camera_id: int = 0,
-                 frame_x: int = 2048,
-                 frame_y: int = 2048,
-                 exposure: float = 0.01,         # seconds
+                 exposure_ms: int = 20,
                  binning: int = 1,
-                 trsource: str = 'internal',
-                 trmode: str = 'normal',
-                 trpolarity: str = 'positive',
-                 tractive: str = 'edge',
-                 subarrayh_pos: int = 0,
-                 subarrayv_pos: int = 0):
-
-        self.camera_id = camera_id
-        # Full sensor size — also the default (full-frame) subarray size.
-        self.sensor_h = frame_x
-        self.sensor_v = frame_y
+                 readout_port: int = 0,
+                 gain: int = 1,
+                 trigger_mode: str = 'Internal Trigger',
+                 roi: tuple[int, int, int, int] | None = None):
+        self.sensor_h = SENSOR_W           # horizontal size (width)
+        self.sensor_v = SENSOR_H           # vertical size (height)
 
         # Cached settings (mirrored to hardware once open).
-        self.exposure = exposure
-        self.binning = binning
-        self.trsource = trsource
-        self.trmode = trmode
-        self.trpolarity = trpolarity
-        self.tractive = tractive
-        self.subarrayh = frame_x
-        self.subarrayv = frame_y
-        self.subarrayh_pos = subarrayh_pos
-        self.subarrayv_pos = subarrayv_pos
+        self.exposure_ms = int(exposure_ms)
+        self.binning = int(binning)
+        self.readout_port = int(readout_port)
+        self.gain = int(gain)
+        self.trigger_mode = trigger_mode
+        h0, v0, w, h = roi if roi else (0, 0, SENSOR_W, SENSOR_H)
+        self.subarrayh, self.subarrayv = int(w), int(h)
+        self.subarrayh_pos, self.subarrayv_pos = int(h0), int(v0)
 
-        self.hamamatsu = None
+        self.device = None          # PVcamDevice
         self._open = False
         self._acquiring = False
+        self._acq_mode = None       # 'live' | 'seq' | None
 
     # ------------------------------------------------------------------ #
     #  Connection
@@ -108,127 +136,135 @@ class HamamatsuCamera:
 
     def open(self) -> bool:
         try:
-            add_path('Hamamatsu_ScopeFoundry')
-            from CameraDevice import HamamatsuDevice
-            self.hamamatsu = HamamatsuDevice(
-                camera_id=self.camera_id,
-                frame_x=self.subarrayh,
-                frame_y=self.subarrayv,
-                acquisition_mode='fixed_length',
-                number_frames=1,
-                exposure=self.exposure,
-                trsource=self.trsource,
-                trmode=self.trmode,
-                trpolarity=self.trpolarity,
-                tractive=self.tractive,
-                subarrayh_pos=self.subarrayh_pos,
-                subarrayv_pos=self.subarrayv_pos,
-                binning=self.binning,
-                hardware=None,
-            )
+            add_path('Teledyne_ScopeFoundry')
+            from CameraDevice import PVcamDevice
+            self.device = PVcamDevice()        # init_pvcam + first camera + defaults
             self._open = True
-            print(f"[Camera] Opened: {self.hamamatsu.getModelInfo()}")
+            try:
+                self.sensor_h = int(self.device.get_width())
+                self.sensor_v = int(self.device.get_height())
+            except Exception:
+                pass
+            # Push the cached settings (readout -> gain, binning, ROI, exposure, trigger).
+            self.set_readout_port(self.readout_port)
+            self.set_gain(self.gain)
+            self.set_binning(self.binning)
+            self.set_roi(self.subarrayh, self.subarrayv,
+                         self.subarrayh_pos, self.subarrayv_pos)
+            self.set_exposure(self.exposure_ms)
+            self.set_trigger_mode(self.trigger_mode)
+            print(f"[Camera] Opened: {self.get_model_info()}")
             return True
         except Exception as e:
             print(f"[Camera] open() failed: {e}")
+            self.device = None
             self._open = False
             return False
 
     def close(self):
-        if self.hamamatsu and self._open:
+        if self.device and self._open:
             try:
-                self.hamamatsu.shutdown()
+                self.stop_acquisition()
+            except Exception:
+                pass
+            try:
+                self.device.close()          # cam.close() + pvc.uninit_pvcam()
             except Exception as e:
-                print(f"[Camera] shutdown error: {e}")
+                print(f"[Camera] close error: {e}")
         self._open = False
         self._acquiring = False
-        self.hamamatsu = None
+        self._acq_mode = None
+        self.device = None
 
     @property
     def is_open(self) -> bool:
         return self._open
 
+    @property
+    def is_acquiring(self) -> bool:
+        return self._acquiring
+
     def get_model_info(self) -> str:
         if self._open:
             try:
-                return self.hamamatsu.getModelInfo()
+                return str(self.device.get_idname())
             except Exception:
                 pass
-        return "Hamamatsu Orca Flash 4V3"
+        return "Teledyne Retiga E7"
 
     # ------------------------------------------------------------------ #
-    #  Exposure
+    #  Exposure (integer ms, PVCAM exp_time)
     # ------------------------------------------------------------------ #
 
-    def set_exposure(self, seconds: float):
-        """HamamatsuDevice.setExposure (seconds)."""
-        self.exposure = seconds
+    def set_exposure(self, ms: int):
+        """PVcamDevice.set_exposure (milliseconds, integer)."""
+        self.exposure_ms = int(round(ms))
         if self._open:
-            self.hamamatsu.setExposure(seconds)
-            self.exposure = self.hamamatsu.getExposure()
+            self.device.set_exposure(self.exposure_ms)
+            self.exposure_ms = int(self.device.get_exposure())
 
-    def get_exposure(self) -> float:
+    def get_exposure(self) -> int:
         if self._open:
-            self.exposure = self.hamamatsu.getExposure()
-        return self.exposure
+            self.exposure_ms = int(self.device.get_exposure())
+        return self.exposure_ms
 
-    def get_internal_frame_rate(self) -> float:
-        """Maximum internal frame rate for the current ROI/exposure."""
-        if self._open:
-            try:
-                return float(self.hamamatsu.getInternalFrameRate())
-            except Exception:
-                return 0.0
-        return 0.0
+    def get_exposure_s(self) -> float:
+        return self.get_exposure() * 1e-3
 
     def get_temperature(self) -> float:
         if self._open:
             try:
-                return float(self.hamamatsu.getTemperature())
+                return float(self.device.get_temperature())
             except Exception:
                 return float('nan')
         return float('nan')
+
+    def get_temperature_setpoint(self) -> float:
+        if self._open:
+            try:
+                return float(self.device.get_temperature_setpoint())
+            except Exception:
+                return float('nan')
+        return float('nan')
+
+    def get_max_frame_rate(self) -> float:
+        """Estimated max internal-trigger frame rate for the current ROI/exposure."""
+        return max_frame_rate_hz(self.subarrayh, self.subarrayv, self.get_exposure_s())
 
     # ------------------------------------------------------------------ #
     #  Binning
     # ------------------------------------------------------------------ #
 
     def set_binning(self, binning: int):
-        """HamamatsuDevice.setBinning. Only valid while idle (not acquiring)."""
+        """PVcamDevice.set_binning (square). Only valid while idle."""
         self.binning = int(binning)
         if self._open:
-            self.hamamatsu.setBinning(int(binning))
-            self.binning = self.hamamatsu.getBinning()
+            self.device.set_binning(self.binning)
+            self.binning = int(self.device.get_binning())
 
     def get_binning(self) -> int:
         if self._open:
-            self.binning = self.hamamatsu.getBinning()
+            self.binning = int(self.device.get_binning())
         return self.binning
 
     # ------------------------------------------------------------------ #
-    #  ROI (subarray) — order matters, mirrors CameraHardware.py
+    #  ROI (sensor pixels) — PVcamDevice.set_roi(h0, v0, width, height)
     # ------------------------------------------------------------------ #
 
     def set_roi(self, hsize: int, vsize: int, hpos: int = 0, vpos: int = 0):
-        """
-        Set the camera ROI. Sizes are forced to multiples of 4 by the device.
-        Must be called while the camera is idle (not acquiring).
-        """
-        self.subarrayh, self.subarrayv = int(hsize), int(vsize)
-        self.subarrayh_pos, self.subarrayv_pos = int(hpos), int(vpos)
+        """Set the camera ROI (unbinned sensor px). Must be called while idle."""
+        hsize = int(np.clip(hsize, 1, self.sensor_h))
+        vsize = int(np.clip(vsize, 1, self.sensor_v))
+        hpos = int(np.clip(hpos, 0, self.sensor_h - hsize))
+        vpos = int(np.clip(vpos, 0, self.sensor_v - vsize))
+        self.subarrayh, self.subarrayv = hsize, vsize
+        self.subarrayh_pos, self.subarrayv_pos = hpos, vpos
         if not self._open:
             return
-        # Sizes first (each resets its position to 0), then enable mode, then positions.
-        self.hamamatsu.setSubarrayH(int(hsize))
-        self.hamamatsu.setSubarrayV(int(vsize))
-        self.hamamatsu.setSubArrayMode()
-        self.hamamatsu.setSubarrayHpos(int(hpos))
-        self.hamamatsu.setSubarrayVpos(int(vpos))
-        self.hamamatsu.setSubArrayMode()
+        self.device.set_roi(hpos, vpos, hsize, vsize)
         self._refresh_roi()
 
     def set_full_frame(self):
-        """Reset ROI to the full sensor."""
         self.set_roi(self.sensor_h, self.sensor_v, 0, 0)
 
     def get_roi(self) -> dict:
@@ -240,102 +276,142 @@ class HamamatsuCamera:
 
     def _refresh_roi(self):
         try:
-            self.subarrayh = int(self.hamamatsu.getSubarrayH())
-            self.subarrayv = int(self.hamamatsu.getSubarrayV())
-            self.subarrayh_pos = int(self.hamamatsu.getSubarrayHpos())
-            self.subarrayv_pos = int(self.hamamatsu.getSubarrayVpos())
+            self.subarrayh = int(self.device.getSubarrayH())
+            self.subarrayv = int(self.device.getSubarrayV())
+            self.subarrayh_pos = int(self.device.getSubarrayHpos())
+            self.subarrayv_pos = int(self.device.getSubarrayVpos())
         except Exception:
             pass
 
     @property
     def eff_h(self) -> int:
-        """Effective horizontal frame size after binning."""
+        """Effective frame width after binning."""
         return int(self.subarrayh // self.binning)
 
     @property
     def eff_v(self) -> int:
-        """Effective vertical frame size after binning."""
+        """Effective frame height after binning."""
         return int(self.subarrayv // self.binning)
 
     # ------------------------------------------------------------------ #
-    #  Trigger
+    #  Readout port / gain (speed table)
     # ------------------------------------------------------------------ #
 
-    def set_trigger_source(self, source: str):
-        """source: 'internal' or 'external'."""
-        self.trsource = source
+    def set_readout_port(self, port: int):
+        """PVcamDevice.set_readout: sets readout_port, speed=0 and resets gain to 1."""
+        self.readout_port = int(port)
         if self._open:
-            self.hamamatsu.setTriggerSource(source)
+            self.device.set_readout(self.readout_port)
+            self.readout_port = int(self.device.get_readout())
+            self.gain = int(self.device.get_gain())
+        else:
+            self.gain = 1
 
-    def get_trigger_source(self) -> str:
+    def get_readout_port(self) -> int:
+        if self._open:
+            self.readout_port = int(self.device.get_readout())
+        return self.readout_port
+
+    def set_gain(self, gain: int):
+        """PVcamDevice.set_gain (1 Full Well; 2 Sensitivity, readout 1/2 only)."""
+        gain = int(gain)
+        if self.readout_port == 0 and gain != 1:
+            print("[Camera] gain 2 is not available on readout port 0 (Speed); using 1")
+            gain = 1
+        self.gain = gain
+        if self._open:
+            self.device.set_gain(gain)
+            self.gain = int(self.device.get_gain())
+
+    def get_gain(self) -> int:
+        if self._open:
+            self.gain = int(self.device.get_gain())
+        return self.gain
+
+    # ------------------------------------------------------------------ #
+    #  Trigger (PVCAM exposure mode)
+    # ------------------------------------------------------------------ #
+
+    def set_trigger_mode(self, mode: str):
+        """mode: one of TRIGGER_MODES (PVcamDevice.set_trigger_mode)."""
+        if mode not in TRIGGER_MODES:
+            raise ValueError(f"Unknown trigger mode {mode!r}; expected one of {TRIGGER_MODES}")
+        self.trigger_mode = mode
+        if self._open:
+            self.device.set_trigger_mode(mode)
+
+    def get_trigger_mode(self) -> str:
         if self._open:
             try:
-                return self.hamamatsu.getTriggerSource()
+                m = self.device.get_trigger_mode()
+                if isinstance(m, str):
+                    self.trigger_mode = m
             except Exception:
                 pass
-        return self.trsource
+        return self.trigger_mode
 
     # ------------------------------------------------------------------ #
-    #  Acquisition control (1:1 passthroughs to HamamatsuDevice)
+    #  Acquisition control (1:1 passthroughs to PVcamDevice)
     # ------------------------------------------------------------------ #
 
-    def set_acquisition(self, mode: str, n_frames: int = 1):
-        """mode: 'fixed_length' or 'run_till_abort'."""
+    def start_live(self):
+        """PVcamDevice.acq_start -> cam.start_live() (circular buffer)."""
         if self._open:
-            self.hamamatsu.acquisition_mode = mode
-            self.hamamatsu.number_frames = int(n_frames)
-
-    def start_acquisition(self):
-        if self._open:
-            self.hamamatsu.startAcquisition()
+            self.device.acq_start()
             self._acquiring = True
+            self._acq_mode = 'live'
 
-    def stop_acquisition(self):
-        # Idempotent: a no-op if nothing is acquiring, so the worker's safety-net
-        # stop won't re-stop / re-release after the scan's own stop.
-        if self._open and self._acquiring:
-            try:
-                with _suppress_stdout():
-                    self.hamamatsu.stopAcquisition()
-            except Exception as e:
-                print(f"[Camera] stopAcquisition error: {e}")
-            self._acquiring = False
-
-    def stop_acquisition_not_releasing(self):
-        # Stops capture but keeps the buffer; leaves _acquiring True so a later
-        # stop_acquisition() still releases the buffer.
+    def start_seq(self, n_frames: int):
+        """PVcamDevice.acq_start_seq(n) -> cam.start_seq(num_frames=n)."""
         if self._open:
-            with _suppress_stdout():
-                self.hamamatsu.stopAcquisitionNotReleasing()
+            self.device.acq_start_seq(int(n_frames))
+            self._acquiring = True
+            self._acq_mode = 'seq'
 
-    def get_last_frame(self) -> np.ndarray | None:
-        """Most-recent frame as a 2-D uint16 array (vertical, horizontal)."""
+    def poll_frame(self, timeout_ms: int | None = None) -> np.ndarray | None:
+        """
+        Oldest buffered frame as a 2-D uint16 array (rows, cols).
+
+        timeout_ms=None -> PVcamDevice.get_nparray() (waits forever, exactly as
+        the ScopeFoundry code). With a timeout the same cam.poll_frame call is
+        used; it raises on timeout so the caller can decide what to do.
+        """
         if not self._open:
             return None
-        [frame, dims] = self.hamamatsu.getLastFrame()
-        data = frame.getData()
-        return np.reshape(data, (dims[1], dims[0]))
+        if timeout_ms is None:
+            return self.device.get_nparray()
+        frame, _fps, _count = self.device.cam.poll_frame(timeout_ms=int(timeout_ms))
+        return frame['pixel_data']
 
-    def get_frames(self) -> tuple[list[np.ndarray], tuple[int, int]]:
-        """All buffered frames (used by the external-trigger scan)."""
-        if not self._open:
-            return [], (0, 0)
-        [frames, dims] = self.hamamatsu.getFrames()
-        imgs = [np.reshape(f.getData(), (dims[1], dims[0])) for f in frames]
-        return imgs, (dims[1], dims[0])
+    def stop_acquisition(self):
+        """PVcamDevice.acq_stop -> cam.finish(). Idempotent."""
+        if self._open and self._acquiring:
+            try:
+                self.device.acq_stop()
+            except Exception as e:
+                print(f"[Camera] acq_stop error: {e}")
+            self._acquiring = False
+            self._acq_mode = None
+
+    def abort(self):
+        """pl_exp_abort: breaks a pending poll_frame (used to interrupt a scan/live)."""
+        if self._open and self._acquiring:
+            try:
+                self.device.cam.abort()
+            except Exception as e:
+                print(f"[Camera] abort error: {e}")
 
     # ------------------------------------------------------------------ #
     #  Convenience helpers (used by the live view + camera panel)
     # ------------------------------------------------------------------ #
 
     def snap(self) -> np.ndarray | None:
-        """Single frame, fixed_length / internal trigger (mirrors measure())."""
+        """Single frame: acq_start_seq(1) -> get_nparray -> acq_stop (as measure())."""
         if not self._open:
             return None
         try:
-            self.set_acquisition('fixed_length', 1)
-            self.start_acquisition()
-            img = self.get_last_frame()
+            self.start_seq(1)
+            img = self.poll_frame(timeout_ms=self.exposure_ms + 10000)
             self.stop_acquisition()
             return img
         except Exception as e:
@@ -343,24 +419,24 @@ class HamamatsuCamera:
             self.stop_acquisition()
             return None
 
-    def start_live(self):
-        """run_till_abort acquisition for live preview."""
-        if not self._open:
-            return
-        self.set_acquisition('run_till_abort', 100)
-        self.start_acquisition()
-
-    def get_live_frame(self) -> np.ndarray | None:
+    def get_live_frame(self, timeout_ms: int | None = None) -> np.ndarray | None:
         if not self._open:
             return None
-        try:
-            return self.get_last_frame()
-        except Exception as e:
-            print(f"[Camera] get_live_frame() error: {e}")
-            return None
+        return self.poll_frame(timeout_ms)
 
     def stop_live(self):
         self.stop_acquisition()
+
+    def settings_dict(self) -> dict:
+        """Current camera settings (stamped into the HDF5 file for provenance)."""
+        return dict(camera=self.get_model_info(),
+                    exposure_ms=self.exposure_ms,
+                    binning=self.binning,
+                    roi_hpos=self.subarrayh_pos, roi_vpos=self.subarrayv_pos,
+                    roi_hsize=self.subarrayh, roi_vsize=self.subarrayv,
+                    readout_port=self.readout_port,
+                    gain=self.gain,
+                    trigger_mode=self.trigger_mode)
 
 
 # ------------------------------------------------------------------ #
@@ -368,54 +444,71 @@ class HamamatsuCamera:
 # ------------------------------------------------------------------ #
 
 class MockCamera:
-    """Animated synthetic Hamamatsu-like frames for offline UI testing.
+    """Animated synthetic Retiga-like frames for offline UI testing.
 
-    Mirrors the HamamatsuCamera API (binning, ROI, acquisition passthroughs)
-    so every panel works identically with or without hardware.
+    Mirrors the RetigaCamera API (ms exposure, binning, ROI, readout/gain,
+    trigger mode, live/sequence acquisition) so every panel works identically
+    with or without hardware. Frames carry a slow cosine modulation so the
+    interferogram plot shows fringes during a mock scan.
     """
 
-    def __init__(self, frame_x=2048, frame_y=2048, binning=1):
+    def __init__(self, frame_x=SENSOR_W, frame_y=SENSOR_H, binning=1, exposure_ms=20):
         self.sensor_h = frame_x
         self.sensor_v = frame_y
         self.subarrayh = frame_x
         self.subarrayv = frame_y
         self.subarrayh_pos = 0
         self.subarrayv_pos = 0
-        self.binning = binning
-        self._exposure = 0.01
+        self.binning = int(binning)
+        self.exposure_ms = int(exposure_ms)
+        self.readout_port = 0
+        self.gain = 1
+        self.trigger_mode = 'Internal Trigger'
         self._open = False
         self._acquiring = False
+        self._acq_mode = None
+        self._seq_left = 0
         self._frame_count = 0
-        self.trsource = 'internal'
 
     # --- connection ---
     def open(self) -> bool:
         self._open = True
-        print("[MockCamera] Opened (simulation — Hamamatsu Orca Flash 4V3)")
+        print("[MockCamera] Opened (simulation — Teledyne Retiga E7)")
         return True
 
     def close(self):
         self._open = False
+        self._acquiring = False
 
     @property
     def is_open(self) -> bool:
         return self._open
 
+    @property
+    def is_acquiring(self) -> bool:
+        return self._acquiring
+
     def get_model_info(self) -> str:
-        return "Hamamatsu Orca Flash 4V3 (MOCK)"
+        return "Teledyne Retiga E7 (MOCK)"
 
     # --- exposure / status ---
-    def set_exposure(self, seconds: float):
-        self._exposure = seconds
+    def set_exposure(self, ms: int):
+        self.exposure_ms = max(1, int(round(ms)))
 
-    def get_exposure(self) -> float:
-        return self._exposure
+    def get_exposure(self) -> int:
+        return self.exposure_ms
 
-    def get_internal_frame_rate(self) -> float:
-        return 1.0 / max(self._exposure, 1e-4)
+    def get_exposure_s(self) -> float:
+        return self.exposure_ms * 1e-3
 
     def get_temperature(self) -> float:
-        return -10.0
+        return -20.0
+
+    def get_temperature_setpoint(self) -> float:
+        return -20.0
+
+    def get_max_frame_rate(self) -> float:
+        return max_frame_rate_hz(self.subarrayh, self.subarrayv, self.get_exposure_s())
 
     # --- binning ---
     def set_binning(self, binning: int):
@@ -426,10 +519,11 @@ class MockCamera:
 
     # --- ROI ---
     def set_roi(self, hsize, vsize, hpos=0, vpos=0):
-        self.subarrayh = int(hsize) - int(hsize) % 4
-        self.subarrayv = int(vsize) - int(vsize) % 4
-        self.subarrayh_pos = int(hpos) - int(hpos) % 4
-        self.subarrayv_pos = int(vpos) - int(vpos) % 4
+        hsize = int(np.clip(hsize, 1, self.sensor_h))
+        vsize = int(np.clip(vsize, 1, self.sensor_v))
+        self.subarrayh, self.subarrayv = hsize, vsize
+        self.subarrayh_pos = int(np.clip(hpos, 0, self.sensor_h - hsize))
+        self.subarrayv_pos = int(np.clip(vpos, 0, self.sensor_v - vsize))
 
     def set_full_frame(self):
         self.set_roi(self.sensor_h, self.sensor_v, 0, 0)
@@ -446,54 +540,84 @@ class MockCamera:
     def eff_v(self) -> int:
         return int(self.subarrayv // self.binning)
 
-    # --- trigger ---
-    def set_trigger_source(self, source: str):
-        self.trsource = source
+    # --- readout / gain ---
+    def set_readout_port(self, port: int):
+        self.readout_port = int(port)
+        self.gain = 1
 
-    def get_trigger_source(self) -> str:
-        return self.trsource
+    def get_readout_port(self) -> int:
+        return self.readout_port
+
+    def set_gain(self, gain: int):
+        self.gain = 1 if self.readout_port == 0 else int(gain)
+
+    def get_gain(self) -> int:
+        return self.gain
+
+    # --- trigger ---
+    def set_trigger_mode(self, mode: str):
+        if mode not in TRIGGER_MODES:
+            raise ValueError(f"Unknown trigger mode {mode!r}")
+        self.trigger_mode = mode
+
+    def get_trigger_mode(self) -> str:
+        return self.trigger_mode
 
     # --- acquisition passthroughs ---
-    def set_acquisition(self, mode: str, n_frames: int = 1):
-        pass
-
-    def start_acquisition(self):
+    def start_live(self):
         self._acquiring = True
+        self._acq_mode = 'live'
 
-    def stop_acquisition(self):
-        self._acquiring = False
+    def start_seq(self, n_frames: int):
+        self._acquiring = True
+        self._acq_mode = 'seq'
+        self._seq_left = int(n_frames)
 
-    def stop_acquisition_not_releasing(self):
-        pass
-
-    def get_last_frame(self) -> np.ndarray | None:
-        if not self._open:
-            return None
+    def poll_frame(self, timeout_ms: int | None = None) -> np.ndarray | None:
+        if not self._open or not self._acquiring:
+            raise RuntimeError("MockCamera: poll_frame called while not acquiring")
+        if self._acq_mode == 'seq':
+            if self._seq_left <= 0:
+                raise RuntimeError("MockCamera: sequence finished (no more frames)")
+            self._seq_left -= 1
+        # Emulate exposure + readout (capped so the mock stays responsive).
+        time.sleep(min(self.exposure_ms, 40) * 1e-3 + 0.005)
         self._frame_count += 1
         return self._make_frame()
 
-    def get_frames(self):
-        imgs = [self._make_frame() for _ in range(5)]
-        return imgs, (self.eff_v, self.eff_h)
+    def stop_acquisition(self):
+        self._acquiring = False
+        self._acq_mode = None
+
+    def abort(self):
+        pass
 
     # --- convenience ---
     def snap(self) -> np.ndarray | None:
         if not self._open:
             return None
-        self._frame_count += 1
-        return self._make_frame()
+        self.start_seq(1)
+        img = self.poll_frame()
+        self.stop_acquisition()
+        return img
 
-    def start_live(self):
-        pass
-
-    def get_live_frame(self) -> np.ndarray | None:
+    def get_live_frame(self, timeout_ms: int | None = None) -> np.ndarray | None:
         if not self._open:
             return None
-        self._frame_count += 1
-        return self._make_frame()
+        return self.poll_frame(timeout_ms)
 
     def stop_live(self):
-        pass
+        self.stop_acquisition()
+
+    def settings_dict(self) -> dict:
+        return dict(camera=self.get_model_info(),
+                    exposure_ms=self.exposure_ms,
+                    binning=self.binning,
+                    roi_hpos=self.subarrayh_pos, roi_vpos=self.subarrayv_pos,
+                    roi_hsize=self.subarrayh, roi_vsize=self.subarrayv,
+                    readout_port=self.readout_port,
+                    gain=self.gain,
+                    trigger_mode=self.trigger_mode)
 
     def _make_frame(self) -> np.ndarray:
         t = self._frame_count * 0.05
@@ -504,15 +628,18 @@ class MockCamera:
         sh, sw = max(1, h // scale), max(1, w // scale)
         frame = np.random.normal(200, 20, (sh, sw)).astype(np.float32)
 
+        # Interferogram-like modulation (cosine fringe vs frame index).
+        fringe = 0.5 * (1.0 + np.cos(2 * np.pi * self._frame_count / 12.0))
         y, x = np.ogrid[:sh, :sw]
         for amp, sigma, cx_f, cy_f, fx, fy in [
-            (50000, 0.10, 0.5, 0.5, 0.5, 0.7),
-            (20000, 0.06, 0.3, 0.35, 0.4, 0.3),
+            (40000, 0.10, 0.5, 0.5, 0.5, 0.7),
+            (15000, 0.06, 0.3, 0.35, 0.4, 0.3),
         ]:
-            cx = sw * (cx_f + 0.1 * np.cos(t * fx))
-            cy = sh * (cy_f + 0.1 * np.sin(t * fy))
+            cx = sw * (cx_f + 0.05 * np.cos(t * fx))
+            cy = sh * (cy_f + 0.05 * np.sin(t * fy))
             sig = sigma * min(sh, sw)
-            frame += amp * np.exp(-((x - cx)**2 + (y - cy)**2) / (2 * sig**2))
+            frame += amp * (0.3 + 0.7 * fringe) * np.exp(
+                -((x - cx) ** 2 + (y - cy) ** 2) / (2 * sig ** 2))
 
         frame = np.repeat(np.repeat(frame, scale, axis=0), scale, axis=1)
         frame = frame[:h, :w]

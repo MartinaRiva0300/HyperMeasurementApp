@@ -2,19 +2,20 @@
 Background workers — all hardware I/O runs in QThreads so the Qt event loop
 (and the live image) stays responsive.
 
-Threading note (requirement 3): the heavy work here is hardware I/O — DCAM
-camera reads and PI GCS moves. Those spend their time inside C extension calls
-that release the Python GIL, so these QThreads genuinely run concurrently with
-the UI on separate cores. (Pure-Python CPU work would still be GIL-bound; none
-of the hot paths here are pure Python.)
+Threading note: the heavy work here is hardware I/O — PVCAM frame polls and PI
+GCS moves. Those spend their time inside C extension calls that release the
+Python GIL, so these QThreads genuinely run concurrently with the UI.
 
 Workers:
-    LiveViewWorker      run_till_abort live preview -> emits frames
+    LiveViewWorker      start_live (circular buffer) + poll_frame -> emits frames
     StagePoller         periodic position read -> emits {axis: mm}
     JogWorker           one move (relative um / absolute mm)
-    HyperSpectralWorker the line scan from hyperspectral_measure.py
-                        (internal + external trigger branches, optional H5)
+    HyperSpectralWorker the line scan from hyperspectral_measure.py (RetigaE7_PI):
+                        'Internal' (step -> 1-frame sequence) and 'Edge'
+                        (PI position trigger -> n-frame sequence), optional H5
 """
+
+from __future__ import annotations
 
 import os
 import time
@@ -26,6 +27,8 @@ try:
 except Exception:                      # pragma: no cover - only needed for saving
     h5py = None
 
+from hardware.camera import max_frame_rate_hz
+
 
 # ------------------------------------------------------------------ #
 #  Live-preview worker
@@ -34,9 +37,10 @@ except Exception:                      # pragma: no cover - only needed for savi
 class LiveViewWorker(QThread):
     """camera.start_live() then repeatedly camera.get_live_frame().
 
-    Throttled to ~`interval_ms` between frames so it never busy-spins (which in
-    mock mode would flood the GUI event queue and freeze the app, and on real
-    hardware would re-pull the same buffer wastefully).
+    poll_frame blocks until the next frame is available (the oldest frame is
+    popped from the PVCAM circular buffer), so the loop paces itself at the
+    camera frame rate. Frames are forwarded to the GUI at most every
+    `interval_ms` so the event queue is never flooded.
     """
 
     new_frame = pyqtSignal(np.ndarray)
@@ -48,6 +52,9 @@ class LiveViewWorker(QThread):
         self.interval_ms = max(1, int(interval_ms))
         self._running = False
 
+    def _timeout_ms(self) -> int:
+        return int(self.camera.get_exposure()) + 2000
+
     def run(self):
         self._running = True
         try:
@@ -55,22 +62,39 @@ class LiveViewWorker(QThread):
         except Exception as e:
             self.error.emit(f"start_live failed: {e}")
             return
+        last_emit = 0.0
+        failures = 0
         try:
             while self._running:
-                frame = self.camera.get_live_frame()
-                if frame is not None:
-                    self.new_frame.emit(frame)
-                else:
+                try:
+                    frame = self.camera.get_live_frame(timeout_ms=self._timeout_ms())
+                except Exception as e:
+                    if not self._running:
+                        break
+                    failures += 1
+                    if failures >= 3:
+                        self.error.emit(f"poll_frame failed: {e}")
+                        break
+                    continue
+                failures = 0
+                if frame is None:
                     self.error.emit("Camera returned no frame.")
                     break
-                self.msleep(self.interval_ms)
+                now = time.monotonic()
+                if (now - last_emit) * 1000.0 >= self.interval_ms:
+                    self.new_frame.emit(frame)
+                    last_emit = now
         finally:
             self.camera.stop_live()
 
     def stop(self):
         """Signal the loop to exit and wait (bounded) for it to finish."""
         self._running = False
-        if not self.wait(2000):
+        try:
+            self.camera.abort()            # break a pending poll_frame
+        except Exception:
+            pass
+        if not self.wait(self._timeout_ms() + 1000):
             # Last resort so the UI can never hang on a stuck driver call.
             self.terminate()
             self.wait()
@@ -138,27 +162,33 @@ class JogWorker(QThread):
 #  Hyperspectral scan worker — port of hyperspectral_measure.measure()
 # ------------------------------------------------------------------ #
 
-# Hamamatsu C11440-42U40 readout constant (see set_motor_velocity Version 4)
-_H_LINE_TIME = 32.4812e-6      # s per horizontal line
-
-# Ring-buffer size for the continuous internal-trigger scan. Frames are consumed
-# continuously, so a small ring suffices; if a long move lets it overrun, only
-# stale frames (which we discard anyway) are overwritten.
-_SCAN_RING_BUFFERS = 16
+# PI trigger output channel used by the Edge-trigger scan (measure()).
+_TRIG_CH, _TRIG_CH_TOT = 1, 4
+# Overshoot (mm) before the start / after the end of the triggered travel, to
+# compensate the delay between trigger and movement start (measure()).
+_TRIG_CORRECTION_MM = 0.05
 
 
 class HyperSpectralWorker(QThread):
     """
-    Performs the hyperspectral line scan, faithfully porting both the internal-
-    and external-trigger branches of hyperspectral_measure.measure().
+    Performs the hyperspectral line scan, porting both branches of
+    hyperspectral_measure.measure() (RetigaE7_PI):
+
+      'internal'  move -> wait on target -> acq_start_seq(1) -> get_nparray ->
+                  acq_stop, for every position (step grid, or a loaded list).
+      'edge'      camera in 'Edge Trigger', acq_start_seq(n); the PI stage
+                  fires a trigger every `step` between start and stop while
+                  travelling at the scan velocity; frames are polled as they
+                  arrive.
 
     scan : single-axis PIStageWrapper (the scan axis)
-    camera : HamamatsuCamera
+    camera : RetigaCamera (or MockCamera)
     params : dict with keys
-        start_pos (mm), step_um (um), step_num (int), trigger ('internal'/'external'),
+        start_pos (mm), step_um (um), step_num (int), trigger ('internal'/'edge'),
+        positions (optional 1-D array of mm targets; internal trigger only),
         save_h5 (bool), save_dir, sample, posx, posy, refresh_ms,
         fast_velocity (mm/s), auto_velocity (bool), motor_velocity (mm/s),
-        xsampling, ysampling, zsampling
+        xsampling, ysampling, zsampling, camera_settings (dict, provenance)
     """
 
     new_image = pyqtSignal(np.ndarray)        # latest image
@@ -175,10 +205,15 @@ class HyperSpectralWorker(QThread):
         self.p = dict(params)
         self._abort = False
         self._h5 = None
+        self._saved_path = ''
 
     # -- public --
     def abort(self):
         self._abort = True
+        try:
+            self.camera.abort()            # break a pending poll_frame
+        except Exception:
+            pass
 
     # -- helpers --
     def _intensity(self, img: np.ndarray) -> float:
@@ -187,19 +222,22 @@ class HyperSpectralWorker(QThread):
         return float(img[r, c])
 
     def _scan_velocity(self) -> float:
-        """Automatic velocity (set_motor_velocity Version 4) or the manual value."""
+        """Automatic velocity (set_motor_velocity, RetigaE7_PI) or the manual value."""
         step_mm = self.p['step_um'] * 1e-3
         if not self.p.get('auto_velocity', True):
             return max(self.p.get('motor_velocity', 0.125), 1e-6)
-        exp = self.camera.get_exposure()
-        V = self.camera.subarrayv
-        frame_rate = 1.0 / (V / 2 * _H_LINE_TIME + exp + 10 * _H_LINE_TIME)
-        vel = step_mm / (4 * exp)
-        required = 1.0 / (step_mm / vel)
-        self.status.emit(f"Max frame rate ~{frame_rate:.1f} Hz; required ~{required:.1f} Hz")
-        if required > 0.85 * frame_rate:
+        exp = self.camera.get_exposure_s()
+        roi = self.camera.get_roi()
+        frame_rate = max_frame_rate_hz(roi['hsize'], roi['vsize'], exp)
+        vel = step_mm / (4 * exp) if exp > 0 else 0.0
+        required = vel / step_mm if step_mm > 0 else 0.0
+        self.status.emit(
+            f"Max frame rate for ROI ({roi['hsize']}×{roi['vsize']}) and exposure "
+            f"{exp*1e3:.0f} ms ~{frame_rate:.1f} Hz; required ~{required:.1f} Hz")
+        if required > 0.85 * frame_rate:           # empirical threshold
             vel = 0.75 * step_mm * frame_rate
-            self.status.emit(f"Velocity capped to {vel:.4f} mm/s for current camera settings")
+            self.status.emit(
+                f"Velocity too high for the camera settings; capped to {vel:.4f} mm/s")
         return max(vel, 1e-6)
 
     # ------------------------------------------------------------------ #
@@ -207,10 +245,10 @@ class HyperSpectralWorker(QThread):
         try:
             if self.p['trigger'] == 'internal':
                 self._run_internal()
-            elif self.p['trigger'] == 'external':
-                self._run_external()
+            elif self.p['trigger'] == 'edge':
+                self._run_edge()
             else:
-                self.error.emit("Trigger must be 'internal' or 'external'.")
+                self.error.emit("Trigger must be 'internal' or 'edge'.")
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -218,152 +256,153 @@ class HyperSpectralWorker(QThread):
                 self.camera.stop_acquisition()
             except Exception:
                 pass
-            if self._h5 is not None:
-                try:
-                    self._h5.close()
-                except Exception:
-                    pass
-                self._h5 = None
+            self._close_h5()
 
-    # ---- internal trigger: stepwise move -> grab a fresh frame -------- #
+    # ---- internal trigger: step -> 1-frame sequence ------------------ #
     def _run_internal(self):
         start = self.p['start_pos']
         step_mm = self.p['step_um'] * 1e-3
-        n = self.p['step_num']
+        n = int(self.p['step_num'])
 
-        self.camera.set_trigger_source('internal')
-        # ONE continuous acquisition for the whole scan: starting/stopping (and
-        # reallocating the full-frame buffer + captureSetup) per step is what made
-        # each step take far longer than the exposure. A small ring buffer is
-        # enough because we consume frames continuously.
-        self.camera.set_acquisition('run_till_abort', _SCAN_RING_BUFFERS)
+        loaded = self.p.get('positions')
+        if loaded is not None and len(loaded) > 0:
+            positions = np.asarray(loaded, dtype=float).ravel()
+            n = len(positions)
+            self.status.emit(f"Using {n} loaded positions ({positions[0]:.4f} → {positions[-1]:.4f} mm)")
+        else:
+            # start + i*step, i = 0..n-1 (final position start + n*step excluded)
+            positions = start + np.arange(n) * step_mm
 
+        self.camera.set_trigger_mode('Internal Trigger')
         self.scan.set_velocity(self.p.get('fast_velocity', 5.0))
-        self.status.emit(f"Moving to start {start:.4f} mm")
-        self.scan.move_absolute(start, wait=True)
+        self.status.emit(f"Moving to start {positions[0]:.4f} mm")
 
-        self.camera.start_acquisition()
+        timeout_ms = int(self.camera.get_exposure()) + 10000
         img_h5 = pos_h5 = None
-        try:
-            for i in range(n):
-                if self._abort:
-                    self.status.emit("Aborted.")
-                    break
+        count = 0
+        for i in range(n):
+            if self._abort:
+                self.status.emit("Interrupted.")
+                break
 
-                # The camera free-runs, so the newest buffered frame may have been
-                # exposed during the move. Drop one in-progress frame, then take the
-                # next one — guaranteed to be exposed after the stage settled.
-                self.camera.get_last_frame()
-                img = self.camera.get_last_frame()
-                if img is None:
-                    self.error.emit(f"No frame at step {i+1}")
-                    return
+            self.scan.move_absolute(float(positions[i]), wait=True)
+            cur = self.scan.get_position()          # waits on target, as measure()
 
-                # Read the encoder right after the frame so the saved position
-                # matches the frame's exposure window as closely as possible.
-                cur = self.scan.get_position_no_wait()
+            # Exactly measure(): acq_start_seq(1) -> get_nparray -> acq_stop
+            self.camera.start_seq(1)
+            try:
+                img = self.camera.poll_frame(timeout_ms=timeout_ms)
+            finally:
+                self.camera.stop_acquisition()
+            if img is None:
+                self.error.emit(f"No frame at step {i+1}")
+                return
 
-                self.new_image.emit(img)
-                self.point.emit(cur, self._intensity(img))
-                self.progress.emit(i + 1, n)
+            self.new_image.emit(img)
+            self.point.emit(cur, self._intensity(img))
+            self.progress.emit(i + 1, n)
 
-                if self.p['save_h5']:
-                    if img_h5 is None:
-                        path, img_h5, pos_h5 = self._create_h5(img, n)
-                        self._saved_path = path
-                    img_h5[i, :, :] = img
-                    pos_h5[i] = cur * 1000.0          # um
-                    self._h5.flush()
+            if self.p['save_h5']:
+                if img_h5 is None:
+                    img_h5, pos_h5 = self._create_h5(img, n)
+                img_h5[i, :, :] = img
+                pos_h5[i] = cur * 1000.0            # um
+                self._h5.flush()
+            count = i + 1
 
-                if i < n - 1:
-                    self.scan.move_absolute(start + (i + 1) * step_mm, wait=True)
-        finally:
-            self.camera.stop_acquisition()
+        self._trim_h5(count)
+        self.finished_scan.emit(self._saved_path if self.p['save_h5'] else '')
 
-        saved = getattr(self, '_saved_path', '') if self.p['save_h5'] else ''
-        self.finished_scan.emit(saved or '')
-
-    # ---- external trigger: PI hardware trigger + run_till_abort ------- #
-    def _run_external(self):
+    # ---- edge trigger: PI position trigger + n-frame sequence --------- #
+    def _run_edge(self):
         start = self.p['start_pos']
         step_mm = self.p['step_um'] * 1e-3
-        n = self.p['step_num']
-        refresh = max(self.p.get('refresh_ms', 50), 1)
-        correction = 0.05
-        ch, ch_tot = 1, 4
+        n = int(self.p['step_num'])
+        if self.p.get('positions') is not None:
+            self.status.emit("Loaded position list is ignored with Edge Trigger (uniform grid used).")
 
-        target = start + n * step_mm
-        forward = target >= start
-        if not forward:
-            correction = -correction
+        # Final position is included: n triggers from start to start+(n-1)*step.
+        target = start + (n - 1) * step_mm
+        correction = _TRIG_CORRECTION_MM if target >= start else -_TRIG_CORRECTION_MM
+        ch, ch_tot = _TRIG_CH, _TRIG_CH_TOT
 
-        self.camera.set_trigger_source('external')
-        self.camera.set_acquisition('run_till_abort', n + 10)
+        self.camera.set_trigger_mode('Edge Trigger')
 
+        # Move a bit before the starting position at high velocity.
         self.scan.set_velocity(self.p.get('fast_velocity', 5.0))
-        self.status.emit(f"Moving to start {start - correction:.4f} mm")
+        self.status.emit(f"Moving to {start - correction:.4f} mm (start − correction)")
         self.scan.move_absolute(start - correction, wait=True)
 
         vel = self._scan_velocity()
         self.scan.set_velocity(vel)
         self.status.emit(f"Scan velocity {vel:.4f} mm/s")
 
-        self.camera.start_acquisition()
-        self.status.emit("Acquisition started (external trigger)")
+        # Sequential acquisition of a fixed number of frames, one per trigger.
+        self.camera.start_seq(n)
+        t0 = time.time()
+        self.status.emit("Acquisition started (Edge Trigger)")
         self.scan.trigger(step_mm, start, target, ch, ch_tot)
         self.scan.move_absolute(target + correction, wait=False)
 
-        # Wait for the stage to traverse, polling only the position for progress.
-        # IMPORTANT: do NOT call get_last_frame()/get_live_frame() here. That
-        # advances the camera's internal frame counter, so the final getFrames()
-        # would return only the last few frames and the rest of the saved stack
-        # (image + position_mm) would be zeros. All frames are collected at once
-        # after the move instead.
-        while not self._abort:
-            pos = self.scan.get_position_no_wait()
-            self.status.emit(f"Scanning… {pos:.4f} mm")
-            if (forward and pos >= target) or (not forward and pos <= target):
-                break
-            self.msleep(int(refresh))
+        positions = np.linspace(start, target, n)       # mm
+        exp_s = self.camera.get_exposure_s()
+        # Generous per-frame timeout: travel to the next trigger at `vel` (+ the
+        # initial overshoot) plus exposure, with margin.
+        timeout_ms = int(1000.0 * (5.0 * (abs(correction) + step_mm) / vel + exp_s + 2.0))
 
-        self.scan.wait_on_target()
-        self.status.emit("Stage on target; collecting frames")
+        img_h5 = pos_h5 = None
+        count = 0
+        misses = 0
+        try:
+            for i in range(n):
+                if self._abort:
+                    break
+                try:
+                    img = self.camera.poll_frame(timeout_ms=timeout_ms)
+                except Exception as e:
+                    if self._abort:
+                        break
+                    misses += 1
+                    on_target = self.scan.is_on_target()
+                    self.status.emit(f"Waiting for frame {i+1}/{n}… ({e})")
+                    if on_target or misses >= 3:
+                        self.status.emit(
+                            f"Stage on target after {count} frame(s); no more triggers expected.")
+                        break
+                    continue
+                misses = 0
+                if img is None:
+                    break
 
-        self.camera.stop_acquisition_not_releasing()
-        frames, _ = self.camera.get_frames()
-        n_frames = len(frames)
-        self.status.emit(f"Acquired {n_frames} frames")
-        positions = np.linspace(start, target, max(n_frames, 1)) * 1000.0   # um
+                self.new_image.emit(img)
+                self.point.emit(float(positions[i]), self._intensity(img))
+                self.progress.emit(i + 1, n)
 
-        saved = ''
-        if self.p['save_h5'] and n_frames > 0 and not self._abort:
-            # Size the datasets to the frames we actually got — no trailing zeros.
-            path, img_h5, pos_h5 = self._create_h5(frames[0], n_frames)
-            saved = path
-            for i in range(n_frames):
-                img_h5[i, :, :] = frames[i]
-                pos_h5[i] = positions[i]
-            self._h5.flush()
-
-        # Replay the acquired frames to the live view + interferogram (display).
-        for i in range(n_frames):
+                if self.p['save_h5']:
+                    if img_h5 is None:
+                        img_h5, pos_h5 = self._create_h5(img, n)
+                    img_h5[i, :, :] = img
+                    pos_h5[i] = positions[i] * 1000.0          # um
+                    self._h5.flush()
+                count = i + 1
+        finally:
             if self._abort:
-                break
-            self.new_image.emit(frames[i])
-            self.point.emit(positions[i] / 1000.0, self._intensity(frames[i]))
-            self.progress.emit(i + 1, max(n_frames, 1))
+                self.scan.halt()
+                self.status.emit("Interrupted.")
+            self.scan.wait_on_target()
+            self.camera.stop_acquisition()
+            self.status.emit(f"Acquisition stopped: {count} frame(s) in {time.time()-t0:.2f} s")
+            # Restore safe state (mirrors measure()).
+            self.scan.trigger_disable(ch_tot)
+            self.camera.set_trigger_mode('Internal Trigger')
+            self.scan.set_velocity(self.p.get('fast_velocity', 5.0))
 
-        # Restore safe state (mirrors measure()).
-        self.scan.trigger_disable(ch_tot)
-        self.camera.set_trigger_source('internal')
-        self.scan.set_velocity(self.p.get('fast_velocity', 5.0))
-
-        if frames:
-            self.new_image.emit(frames[-1])
-        self.finished_scan.emit(saved)
+        self._trim_h5(count)
+        self.finished_scan.emit(self._saved_path if self.p['save_h5'] else '')
 
     # ---- HDF5 helpers ------------------------------------------------- #
     def _create_h5(self, sample_img: np.ndarray, length: int):
+        """Same layout as the ScopeFoundry h5_io file: measurement/hyper/t0/c0/{image,position_mm}."""
         if h5py is None:
             raise RuntimeError("h5py is not installed — cannot save .h5")
         save_dir = self.p.get('save_dir') or os.path.expanduser('~/hyper_data')
@@ -374,16 +413,45 @@ class HyperSpectralWorker(QThread):
         fname = os.path.join(save_dir, '_'.join(parts) + '.h5')
 
         self._h5 = h5py.File(fname, 'w')
+        self._saved_path = fname
         grp = self._h5.create_group('measurement/hyper')
         h, w = sample_img.shape
         img_h5 = grp.create_dataset('t0/c0/image', shape=(length, h, w),
-                                    dtype=sample_img.dtype)
+                                    maxshape=(None, h, w), dtype=sample_img.dtype)
         img_h5.attrs['element_size_um'] = [self.p.get('zsampling', 1.0),
                                            self.p.get('ysampling', 1.0),
                                            self.p.get('xsampling', 1.0)]
         pos_h5 = grp.create_dataset('t0/c0/position_mm', shape=(length,),
-                                    dtype=np.float32)
-        # Stamp the key scan settings for provenance.
-        for k in ('start_pos', 'step_um', 'step_num', 'trigger'):
-            grp.attrs[k] = self.p.get(k)
-        return fname, img_h5, pos_h5
+                                    maxshape=(None,), dtype=np.float32)
+        # Stamp the scan settings + camera settings for provenance.
+        for k in ('start_pos', 'step_um', 'step_num', 'trigger', 'motor_velocity',
+                  'auto_velocity', 'sample'):
+            v = self.p.get(k)
+            if v is not None:
+                grp.attrs[k] = v
+        for k, v in (self.p.get('camera_settings') or {}).items():
+            if v is not None:
+                grp.attrs[f'camera_{k}'] = v
+        self._img_h5, self._pos_h5 = img_h5, pos_h5
+        return img_h5, pos_h5
+
+    def _trim_h5(self, count: int):
+        """Shrink the datasets to the frames actually acquired (no trailing zeros)."""
+        if self._h5 is None:
+            return
+        try:
+            if count > 0 and self._img_h5.shape[0] != count:
+                self._img_h5.resize(count, axis=0)
+                self._pos_h5.resize(count, axis=0)
+            self._h5.attrs['frames_acquired'] = count
+            self._h5.flush()
+        except Exception as e:
+            self.status.emit(f"Could not trim HDF5 datasets: {e}")
+
+    def _close_h5(self):
+        if self._h5 is not None:
+            try:
+                self._h5.close()
+            except Exception:
+                pass
+            self._h5 = None

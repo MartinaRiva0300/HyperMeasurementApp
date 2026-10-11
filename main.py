@@ -2,15 +2,17 @@
 """
 Hyperspectral Control App
 =========================
-Hamamatsu Orca Flash 4V3  +  PI motorised stage (PI_VC_Device)
+Teledyne Retiga E7 (PVCAM / PyVCAM)  +  PI motorised stage (PI_VC_Device)
 
 Three panels:
-  1. Camera   — exposure, binning, ROI, trigger, live view (pyqtgraph)
+  1. Camera   — exposure (ms), binning, readout port, gain, trigger mode, ROI,
+                live view (pyqtgraph)
   2. Stage    — per-axis encoder read-back, to-go position, relative jog,
                 velocity, home/halt
-  3. Measurement — the hyperspectral line scan (port of hyperspectral_measure.py):
-                start_pos, step, step_num, internal/external trigger, motor
-                velocity, HDF5 saving, live image + interferogram plot.
+  3. Measurement — the hyperspectral line scan (port of hyperspectral_measure.py,
+                RetigaE7_PI branch): start_pos, step, step_num, Internal/Edge
+                trigger, positions from file, motor velocity, HDF5 saving,
+                live image + interferogram plot.
 
 All hardware I/O runs in background QThreads (see core/acquisition.py) so the
 UI and live image stay responsive.
@@ -18,13 +20,14 @@ UI and live image stay responsive.
 RUN
 ---
     python main.py              # mock hardware (no physical devices needed)
-    python main.py --real       # real Hamamatsu + PI hardware
+    python main.py --real       # real Retiga E7 + PI hardware
 
 CONFIGURE REAL HARDWARE
 -----------------------
 Edit make_real_hardware() below: set the PI USB serial number(s) / axis ids and
-camera defaults. PI_VC_device.py and CameraDevice.py are imported from their
-sibling ScopeFoundry Projects folders automatically (see hardware/*.py).
+camera defaults. CameraDevice.py (Teledyne_ScopeFoundry) and PI_VC_device.py
+(PI_ScopeFoundry) are imported from their sibling ScopeFoundry Projects folders
+automatically (see hardware/*.py).
 """
 
 import sys
@@ -47,36 +50,32 @@ def make_mock_hardware():
     """Simulated stage + camera for UI development (no devices needed)."""
     from hardware.camera import MockCamera
     from hardware.stage import MockPIStage
-    camera = MockCamera(frame_x=2048, frame_y=2048, binning=1)
+    camera = MockCamera(frame_x=3200, frame_y=2200, binning=1, exposure_ms=20)
     stage = MockPIStage(axes=('1',))
     return camera, stage
 
 
 def make_real_hardware():
     """
-    Real Hamamatsu + PI stage.
+    Real Retiga E7 + PI stage.
     ▶ Edit serial numbers / axis ids and camera defaults here.
     """
-    from hardware.camera import HamamatsuCamera
+    from hardware.camera import RetigaCamera
     from hardware.stage import PIStageWrapper, StageManager
 
-    camera = HamamatsuCamera(
-        camera_id=0,
-        frame_x=2048,
-        frame_y=2048,
-        exposure=0.01,        # seconds
+    camera = RetigaCamera(
+        exposure_ms=20,                 # integer milliseconds
         binning=1,
-        trsource='internal',
-        trmode='normal',
-        trpolarity='positive',
-        tractive='edge',
-        subarrayh_pos=0,
-        subarrayv_pos=0,
+        readout_port=0,                 # 0 Speed, 1 Long Exposure, 2 Long Exposure EDR
+        gain=1,                         # 1 Full Well (2 Sensitivity on readout 1/2)
+        trigger_mode='Internal Trigger',
+        roi=(0, 0, 3200, 2200),         # h0, v0, width, height (sensor px)
     )
 
     # ── Edit serial number(s) to match your devices ────────────── #
+    # Same controller as hyperspectral_app.py (PI_HW, encoder='VC').
     stage = StageManager([
-        PIStageWrapper('0185500162', axis='1'),     # ← your serial here
+        PIStageWrapper('0024550348', axis='1'),     # ← your serial here
         # PIStageWrapper('0185500007', axis='2'),   # uncomment for more axes
     ])
 
@@ -86,7 +85,7 @@ def make_real_hardware():
 # ── Entry point ────────────────────────────────────────────────────────── #
 
 def main():
-    parser = argparse.ArgumentParser(description="Hyperspectral Control App")
+    parser = argparse.ArgumentParser(description="Hyperspectral Control App (Retiga E7 + PI)")
     parser.add_argument('--real', action='store_true',
                         help="Use real hardware (default: simulation mode)")
     args = parser.parse_args()

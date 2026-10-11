@@ -138,6 +138,16 @@ class PIStageWrapper:
             with self._lock:
                 self.motor.wait_on_target()
 
+    def is_on_target(self) -> bool:
+        """Non-blocking qONT read (PI_VC_Device.wait_on_target polls the same query)."""
+        if not self._connected:
+            return True
+        try:
+            with self._lock:
+                return bool(self.motor.pi_device.qONT(self.motor.axis)[self.motor.axis])
+        except Exception:
+            return False
+
     def halt(self):
         if self._connected:
             with self._lock:
@@ -324,6 +334,9 @@ class MockAxis:
 
     def wait_on_target(self):
         time.sleep(0.01)
+
+    def is_on_target(self) -> bool:
+        return True
 
     def halt(self):
         pass
